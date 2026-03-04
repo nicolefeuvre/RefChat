@@ -1,0 +1,55 @@
+# =============================================================================
+# RefChat — Stopwords personnalisés pour le clustering thématique
+# =============================================================================
+# Un mot ou bigramme par ligne. Les lignes vides et les lignes commençant
+# par # sont ignorées. Ces mots s'ajoutent aux stopwords FR/EN/DOC intégrés.
+#
+# Le script recharge ce fichier à chaque lancement : pas besoin de modifier
+# le code Python. Chaque utilisateur adapte selon son corpus.
+# =============================================================================
+
+# --- Artefacts de thèses et rapports académiques français ---
+# (décommentez les lignes utiles pour votre corpus)
+ merci
+ remerciements
+ thèse
+ université
+ directeur
+ laboratoire
+ figure
+ tableau
+ chapitre
+ annexe
+ sont
+ mes
+ travail
+ également
+ mavoir
+ jai
+ souhaite
+ remercier
+ remerciements
+ sincères
+ ensemble
+ tenu
+
+# --- Artefacts de thèses anglophones ---
+ acknowledgements
+ university
+ department
+ professor
+ thesis
+ chapter
+ appendix
+
+# --- Mots trop génériques pour votre domaine spécifique ---
+# Exemple : si "geological" ou "natural" apparaissent dans tous vos clusters
+# sans valeur discriminante, ajoutez-les ici :
+ geological
+ natural
+ study
+
+# --- Bigrammes (deux mots séparés par un espace) ---
+# Exemple : si "et al" ou "fig caption" polluent vos thèmes :
+ et al
+ fig caption
