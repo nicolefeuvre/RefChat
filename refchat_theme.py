@@ -163,15 +163,60 @@ def _load_stopwords(base_path: Path) -> list:
     builtin = set(_SW_FR + _SW_EN + _SW_DOC)
     user_words = set()
     sw_file = base_path / "refchat_stopwords.txt"
-    if sw_file.exists():
+
+    if not sw_file.exists():
+        # Auto-generate template on first run
+        _SW_TEMPLATE = (
+            "# ============================================================\n"
+            "#  RefChat — User stopwords for topic clustering\n"
+            "# ============================================================\n"
+            "#  Add one word per line. Lines starting with # are ignored.\n"
+            "#  These words are excluded from topic LABELS only — they do\n"
+            "#  NOT affect your ChromaDB content or search results.\n"
+            "#\n"
+            "#  TIP: always run a dry-run first to check results before\n"
+            "#  writing to the database:\n"
+            "#    python refchat_theme.py --dry-run --topics 60 --show\n"
+            "#\n"
+            "# ------------------------------------------------------------\n"
+            "#  Common corpus-specific words to consider adding:\n"
+            "#  (uncomment or add your own below)\n"
+            "# ------------------------------------------------------------\n"
+            "\n"
+            "# Too generic in geoscience bibliographies:\n"
+            "# basin\n"
+            "# basins\n"
+            "# crust\n"
+            "# fault\n"
+            "# water\n"
+            "# fluid\n"
+            "\n"
+            "# Parasitic label tokens detected in topic labels:\n"
+            "# moments\n"
+            "# peu\n"
+            "\n"
+            "# ============================================================\n"
+            "#  Add your own words below this line:\n"
+            "# ============================================================\n"
+            "\n"
+        )
+        try:
+            sw_file.write_text(_SW_TEMPLATE, encoding="utf-8")
+            _log("   [INFO] refchat_stopwords.txt created — edit it to add corpus-specific stopwords.")
+            _log("         Run --dry-run first to validate results before writing to the database.")
+        except Exception as e:
+            _log(f"   [WARN] Could not create refchat_stopwords.txt : {e}")
+    else:
         with open(sw_file, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     user_words.add(line.lower())
-        _log(f"   Stopwords utilisateur : {len(user_words)} mot(s) charges depuis refchat_stopwords.txt")
-    else:
-        _log("   (refchat_stopwords.txt absent — stopwords integres utilises)")
+        if user_words:
+            _log(f"   User stopwords: {len(user_words)} word(s) loaded from refchat_stopwords.txt")
+        else:
+            _log("   refchat_stopwords.txt found but no custom words active (all commented out)")
+
     return list(builtin | user_words)
 
 
@@ -279,11 +324,10 @@ def _update_chroma_metadata(db, article_map, filename_to_theme):
 
     BATCH_SIZE = 500
     updated = 0
-    for i in tqdm(range(0, len(all_ids), BATCH_SIZE), desc="   Writing to ChromaDB"):
-        # Update metadatas only — do NOT pass documents or embeddings
-        # to avoid ChromaDB dimension validation (embeddings are not touched)
+    for i in tqdm(range(0, len(all_ids), BATCH_SIZE), desc="   Ecriture ChromaDB"):
         db._collection.update(
             ids=all_ids[i:i+BATCH_SIZE],
+            documents=all_docs[i:i+BATCH_SIZE],
             metadatas=all_metas[i:i+BATCH_SIZE],
         )
         updated += len(all_ids[i:i+BATCH_SIZE])

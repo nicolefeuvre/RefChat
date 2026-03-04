@@ -561,11 +561,9 @@ def api_chat():
             nb_web_total    = 0  # Nombre total de résultats disponibles sur Semantic Scholar
             history_to_send = conversation_history[-(MAX_HISTORY*2):] if STATE["memory_enabled"] else []
 
-            # -- Theme detection --
-            themes_dispo   = lister_themes(db)
-            theme_detecte  = detecter_theme_query(query, themes_dispo)
-            # theme_filter : apply only if detected AND user has not disabled it
-            theme_filter_active = theme_detecte if theme_detecte and not request.json.get("disable_theme_filter", False) else None
+            # -- Detection de theme --
+            themes_dispo  = lister_themes(db)
+            theme_detecte = detecter_theme_query(query, themes_dispo)
 
             if mode == "auteur":
                 nom = extraire_nom_auteur(query)
@@ -617,7 +615,6 @@ def api_chat():
                     articles_info, docs = recuperer_articles_complets(
                         db, query_enrichie, k_initial=k_initial_val,
                         max_articles=ma_eff, max_chunks_par_article=mca_eff,
-                        theme_filter=theme_filter_active,
                     )
 
                     # ── Mode HYBRIDE : ajouter résultats web ──
@@ -678,7 +675,7 @@ def api_chat():
             tokens_in = int(chars_in / 3.5) + 150 
             tokens_out = int(len(full_response) / 3.5)
 
-            yield f"data: {json.dumps({'done': True, 'mode': mode, 'theme_detected': theme_detecte or '', 'theme_filter_active': theme_filter_active or '', 'themes_available': themes_dispo, 'articles': articles_out, 'sources': sources_info, 'nom_llm': STATE['nom_llm'], 'elapsed': round(time.time()-t_start,1), 'history_count': len(conversation_history)//2, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'nb_web_total': nb_web_total})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'mode': mode, 'theme_detected': theme_detecte or '', 'themes_available': themes_dispo, 'articles': articles_out, 'sources': sources_info, 'nom_llm': STATE['nom_llm'], 'elapsed': round(time.time()-t_start,1), 'history_count': len(conversation_history)//2, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'nb_web_total': nb_web_total})}\n\n"
 
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -1283,9 +1280,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="web-dot" style="width:8px; height:8px; border-radius:50%; background:var(--text3); transition:all 0.3s;"></div>
         <span id="web-label" style="font-weight:600;">🗄️ Local only</span>
       </div>
-      <div id="theme-filter-badge" onclick="toggleThemeFilter()" title="Thematic filter ON — search restricted to detected theme" style="display:inline-flex; align-items:center; gap:5px; background:#0d1f17; border:1px solid #7ee787; color:#7ee787; font-size:0.72rem; padding:6px 10px; border-radius:8px; font-family:'DM Mono',monospace; transition:all 0.3s; cursor:pointer; margin-bottom:6px; width:100%; justify-content:center;">
-        <span class="tf-label" style="font-weight:600;">🏷️ Theme filter</span>
-      </div>
 
       <div id="new-articles-badge" style="display:none;background:#1a2a3a;border:1px solid var(--accent);border-radius:8px;padding:10px 12px;margin-bottom:6px;">
         <div style="font-size:0.75rem;color:var(--accent);font-weight:600;margin-bottom:6px" id="new-articles-label">📥 0 new articles</div>
@@ -1325,30 +1319,6 @@ let currentAbortController = null;
 
 // 3 états : false=local seul | true=hybride | "only"=web seul
 let webSearchEnabled = false;
-
-// Theme filter : true = restrict search to detected theme, false = global search
-let themeFilterEnabled = true;
-
-function toggleThemeFilter() {
-  themeFilterEnabled = !themeFilterEnabled;
-  const badge = document.getElementById('theme-filter-badge');
-  if (!badge) return;
-  if (themeFilterEnabled) {
-    badge.style.borderColor = '#7ee787';
-    badge.style.color       = '#7ee787';
-    badge.style.background  = '#0d1f17';
-    badge.title = 'Thematic filter ON — search restricted to detected theme';
-    badge.querySelector('.tf-label').textContent = '🏷️ Theme filter';
-    sysMsg('— Thematic filter enabled: search restricted to detected theme —');
-  } else {
-    badge.style.borderColor = 'var(--border)';
-    badge.style.color       = 'var(--text3)';
-    badge.style.background  = 'var(--bg3)';
-    badge.title = 'Thematic filter OFF — global search across all themes';
-    badge.querySelector('.tf-label').textContent = '🏷️ No filter';
-    sysMsg('— Thematic filter disabled: global search —');
-  }
-}
 
 function toggleWebSearch() {
   if      (webSearchEnabled === false) webSearchEnabled = true;
@@ -1890,8 +1860,7 @@ async function sendQuery() {
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
           query: query,
-          web_search: webSearchEnabled,
-          disable_theme_filter: !themeFilterEnabled
+          web_search: webSearchEnabled
       }), 
       signal:currentAbortController.signal
     });
@@ -1915,13 +1884,7 @@ async function sendQuery() {
         if (payload.done) {
           const meta=payload;
           const modeMap={question:'💬 Question',resume:'📋 Summary',reference:'🔎 References',auteur:'👤 Author'};
-          let html=`<div class="mode-badge mode-${meta.mode||'question'}">${modeMap[meta.mode]||'💬 Question'}</div>`;
-          if (meta.theme_filter_active) {
-            html+=`<div class="mode-badge" style="background:#0d1f17;border:1px solid #7ee787;color:#7ee787;font-size:0.68rem;margin-bottom:4px;">🏷️ Thematic search — <em>${escHtml(meta.theme_filter_active)}</em></div>`;
-          } else if (meta.theme_detected && !meta.theme_filter_active) {
-            html+=`<div class="mode-badge" style="background:var(--bg3);border:1px solid var(--border);color:var(--text3);font-size:0.68rem;margin-bottom:4px;">🏷️ Theme detected: <em>${escHtml(meta.theme_detected)}</em> — filter off</div>`;
-          }
-          html+=marked.parse(fullText);
+          let html=`<div class="mode-badge mode-${meta.mode||'question'}">${modeMap[meta.mode]||'💬 Question'}</div>`+marked.parse(fullText);
           if (meta.articles&&meta.articles.length) {
             html+=`<div class="articles-info"><div class="articles-info-title">📂 ${meta.articles.length} article(s) analyzed</div>`;
             for (const a of meta.articles) {
@@ -2244,9 +2207,14 @@ function openThemePanel() {
       <span class="ingest-title">🏷️ Thématisation en cours…</span>
     </div>
     <div style="background:rgba(63,185,80,0.08);border:1px solid var(--accent2);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:0.78rem;color:var(--text);line-height:1.5">
-      💡 <strong>Que fait ce bouton ?</strong><br>
-      Analyse les embeddings déjà en base pour regrouper tes articles par thèmes automatiquement.
-      Durée : 2–5 min. Aucune lecture de PDF. Pas besoin de Docker.
+      💡 <strong>What does this do?</strong><br>
+      Analyses existing embeddings to automatically group your articles into themes.
+      Duration: 2–5 min. No PDF re-reading. No Docker needed.<br><br>
+      ⚠️ <strong>Recommended workflow:</strong><br>
+      1. Run a <strong>dry-run first</strong> from the command line to check results:<br>
+      <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">python refchat_theme.py --dry-run --topics 60 --show</code><br>
+      2. Edit <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">refchat_stopwords.txt</code> to remove parasitic label words if needed.<br>
+      3. Only then launch here to write themes to the database.
     </div>
     <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
       <label style="font-size:0.75rem;color:var(--text2);font-family:'DM Mono',monospace;white-space:nowrap">Nb thèmes :</label>
@@ -2296,7 +2264,7 @@ function openThemePanel() {
         } else {
           if (title) title.textContent = '✅ Thématisation terminée !';
           if (barEl) barEl.style.background = 'var(--accent2)';
-          if (doneEl) { doneEl.style.display = 'block'; doneEl.textContent = '✅ Thèmes enregistrés dans la base — sidebar mise à jour.'; }
+          if (doneEl) { doneEl.style.display = 'block'; doneEl.innerHTML = '✅ Themes saved to database — sidebar updated.<br><span style="font-size:0.75rem;color:var(--text3)">💡 If results look off, edit <code>refchat_stopwords.txt</code> and re-run the dry-run before launching again.</span>'; }
           showToast('✅ Thématisation terminée !');
           await loadThemes();
         }
