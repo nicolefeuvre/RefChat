@@ -27,7 +27,7 @@ from refchat_llm import (
     detecter_mode, extraire_nom_auteur,
     chercher_par_auteur, recuperer_articles_complets,
     chercher_semantic_scholar,
-    format_docs, expand_query, charger_llm,
+    format_docs, expand_query, charger_llm, charger_bm25,
     extraire_mots_cles_llm,
     lister_themes, recuperer_articles_par_theme, detecter_theme_query,
 )
@@ -42,6 +42,7 @@ STATE = {
     "db": None, "llm": None, "nom_llm": None,
     "ready": False, "error": None, "modele": "api",
     "MAX_ARTICLES": 3, "MAX_CHUNKS_ARTICLE": 5, "K_INITIAL": 8,
+    "bm25": None, "reranker": None,
     "memory_enabled": False,
     # Ingestion
     "ingest_running": False,
@@ -57,13 +58,40 @@ STATE = {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_db_path():
-    return cfg.get("db_path", str(pathlib.Path(__file__).parent / "chroma_db"))
+    return cfg.get("db_path", str(cfg.PERSONAL_DATA / "chroma_db"))
+
+def _detect_device_and_batch():
+    """Auto-detect best compute device + safe batch size for the embedding model.
+    Priority: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
+    CUDA batch size is scaled to available VRAM to avoid OOM on small GPUs.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if   vram_gb >= 8: batch = 512
+                elif vram_gb >= 6: batch = 256
+                elif vram_gb >= 4: batch = 128
+                else:              batch = 64
+            except Exception:
+                batch = 128
+            return "cuda", batch
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps", 128   # Apple Silicon — unified memory, conservative default
+    except ImportError:
+        pass
+    return "cpu", 256
+
 
 def get_embedding():
+    device, batch_size = _detect_device_and_batch()
+    if device != "cpu":
+        print(f"⚡ Embeddings: {device.upper()} — batch_size={batch_size}")
     return HuggingFaceEmbeddings(
         model_name=cfg.EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True, "batch_size": 256},
+        model_kwargs={"device": device},
+        encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
     )
 
 def init_system(modele="api"):
@@ -84,6 +112,15 @@ def init_system(modele="api"):
         db_path = get_db_path()
         STATE["db"]  = Chroma(persist_directory=db_path, embedding_function=get_embedding())
         STATE["llm"], STATE["nom_llm"] = charger_llm(modele)
+        STATE["bm25"] = charger_bm25(STATE["db"])
+
+        try:
+            from sentence_transformers import CrossEncoder
+            # Multilingual MS MARCO cross-encoder (~120 MB) — reranks top candidates
+            # for maximum precision on FR/EN mixed libraries.
+            STATE["reranker"] = CrossEncoder("nreimers/mmarco-mMiniLMv2-L12-H384-v1")
+        except Exception:
+            STATE["reranker"] = None  # optional — falls back to RRF ranking
 
         if modele != "api":
             import urllib.request as _ur
@@ -342,6 +379,7 @@ def api_config_get():
         "num_batch":                c.get("num_batch", ""),
         "ollama_num_ctx_local":     c.get("ollama_num_ctx_local", 4096),
         "ollama_temperature":       c.get("ollama_temperature", 0.1),
+        "bm25_weight":              c.get("bm25_weight", 0.3),
     })
 
 @app.route("/api/config", methods=["POST"])
@@ -350,13 +388,15 @@ def api_config_save():
     try:
         allowed = ("zotero_path","db_path","llm_model","mistral_api_key",
                    "semantic_scholar_api_key","num_thread","num_gpu","num_batch",
-                   "ollama_num_ctx_local","ollama_temperature")
+                   "ollama_num_ctx_local","ollama_temperature","bm25_weight")
         updates = {k: data[k] for k in allowed if k in data}
         for k in ("num_thread","num_gpu","num_batch","ollama_num_ctx_local"):
             if k in updates and str(updates[k]).strip() != "":
                 updates[k] = int(updates[k])
         if "ollama_temperature" in updates and str(updates["ollama_temperature"]).strip() != "":
             updates["ollama_temperature"] = float(updates["ollama_temperature"])
+        if "bm25_weight" in updates and str(updates["bm25_weight"]).strip() != "":
+            updates["bm25_weight"] = float(updates["bm25_weight"])
         cfg.save(updates)
         return jsonify({"success": True})
     except Exception as e:
@@ -371,7 +411,7 @@ def api_ingest_scan():
     try:
         import refchat_ingest
         tous = refchat_ingest._scan_zotero_pdfs(zotero)
-        suivi_path = pathlib.Path(__file__).parent / "refchat_index_db.json"
+        suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
         # Already processed = indexed OR explicitly rejected (chunks=0 means rejected/blacklisted)
         deja = set()
         if suivi_path.exists():
@@ -431,7 +471,7 @@ def api_ingest_scan_full():
     try:
         import refchat_ingest
         tous = refchat_ingest._scan_zotero_pdfs(zotero)
-        suivi_path = pathlib.Path(__file__).parent / "refchat_index_db.json"
+        suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
         deja = set()
         if suivi_path.exists():
             try:
@@ -456,6 +496,124 @@ def api_ingest_scan_full():
         return jsonify({"nouveaux": nouveaux})
     except Exception as e:
         return jsonify({"nouveaux": [], "erreur": str(e)})
+
+@app.route("/api/db/articles")
+def api_db_articles():
+    """List all currently indexed articles with metadata (from tracking file + ChromaDB)."""
+    db = STATE["db"]
+    if not db:
+        return jsonify({"articles": [], "total": 0, "error": "DB not loaded"})
+    try:
+        suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
+        suivi = {}
+        if suivi_path.exists():
+            with open(suivi_path, encoding="utf-8") as f:
+                suivi = json.load(f)
+
+        # Build base info from tracking file (full path → info)
+        fname_info = {}
+        for path, info in suivi.items():
+            if not isinstance(info, dict):
+                continue
+            chunks = info.get("chunks", 0)
+            if chunks == 0:
+                continue  # blacklisted / rejected
+            fn = os.path.basename(path)
+            if fn not in fname_info:
+                fname_info[fn] = {
+                    "filename": fn,
+                    "nb_chunks": chunks,
+                    "date": info.get("date", ""),
+                    "auteur": "", "annee": "", "titre": "", "doc_type": "article",
+                }
+
+        if fname_info:
+            # Enrich with ChromaDB metadata (metadatas only, no documents — fast)
+            total = db._collection.count()
+            enriched = 0
+            for offset in range(0, total, 2000):
+                r = db._collection.get(limit=2000, offset=offset, include=["metadatas"])
+                for meta in r["metadatas"]:
+                    fn = meta.get("filename", "")
+                    if fn in fname_info and not fname_info[fn]["auteur"]:
+                        fname_info[fn]["auteur"]   = meta.get("auteur", "")
+                        fname_info[fn]["annee"]    = meta.get("annee", "")
+                        fname_info[fn]["titre"]    = meta.get("titre", "")
+                        fname_info[fn]["doc_type"] = meta.get("doc_type", "article")
+                        enriched += 1
+                if enriched >= len(fname_info):
+                    break  # all articles enriched, stop early
+
+        articles = sorted(fname_info.values(), key=lambda x: (x.get("auteur") or x["filename"]).lower())
+        return jsonify({"articles": articles, "total": len(articles)})
+    except Exception as e:
+        return jsonify({"articles": [], "total": 0, "error": str(e)})
+
+
+@app.route("/api/db/delete", methods=["POST"])
+def api_db_delete():
+    """Delete articles from ChromaDB + add to blacklist + remove from tracking file."""
+    data = request.get_json() or {}
+    filenames = data.get("filenames", [])
+    if not filenames:
+        return jsonify({"success": False, "error": "No filenames provided"})
+    db = STATE["db"]
+    if not db:
+        return jsonify({"success": False, "error": "Database not loaded"})
+
+    errors = []
+
+    # 1. Delete all chunks from ChromaDB
+    for fname in filenames:
+        try:
+            db._collection.delete(where={"filename": fname})
+        except Exception as e:
+            errors.append(f"{fname}: {e}")
+
+    # 2. Add to blacklist (refchat_ignore.txt stays next to scripts)
+    ignore_path = pathlib.Path(__file__).parent / "refchat_ignore.txt"
+    existing = set()
+    if ignore_path.exists():
+        with open(ignore_path, encoding="utf-8") as f:
+            existing = {l.strip() for l in f if l.strip()}
+    new_entries = [fn for fn in filenames if fn not in existing]
+    if new_entries:
+        with open(ignore_path, "a", encoding="utf-8") as f:
+            for fn in new_entries:
+                f.write(fn + "\n")
+
+    # 3. Remove from tracking file
+    suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
+    if suivi_path.exists():
+        try:
+            with open(suivi_path, encoding="utf-8") as f:
+                tracking = json.load(f)
+            if isinstance(tracking, dict):
+                fnames_set = set(filenames)
+                keys_to_remove = [k for k in tracking if os.path.basename(k) in fnames_set]
+                for k in keys_to_remove:
+                    del tracking[k]
+                with open(suivi_path, "w", encoding="utf-8") as f:
+                    json.dump(tracking, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            errors.append(f"tracking update: {e}")
+
+    # 4. Invalidate BM25 cache (will be rebuilt on next query)
+    bm25_cache = cfg.PERSONAL_DATA / "bm25_index.pkl"
+    if bm25_cache.exists():
+        try:
+            bm25_cache.unlink()
+            STATE["bm25"] = None  # force rebuild in memory too
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": len(errors) == 0,
+        "deleted": len(filenames),
+        "blacklisted": len(new_entries),
+        "errors": errors,
+    })
+
 
 @app.route("/api/ingest/start", methods=["POST"])
 def api_ingest_start():
@@ -631,7 +789,14 @@ def api_chat():
                         else:
                             ma_eff  = max(2, max_articles // 2) if (web_search_requested and STATE["modele"] != "api") else max_articles
                             mca_eff = max(3, max_chunks_art // 2) if (web_search_requested and STATE["modele"] != "api") else max_chunks_art
-                            ai_local, docs = recuperer_articles_complets(db, query_enrichie, k_initial=k_initial_val, max_articles=ma_eff, max_chunks_par_article=mca_eff)
+                            bm25_w = float(cfg.get("bm25_weight", 0.3))
+                            ai_local, docs = recuperer_articles_complets(
+                                db, query_enrichie,
+                                bm25_retriever=STATE["bm25"], bm25_weight=bm25_w,
+                                k_initial=k_initial_val, max_articles=ma_eff,
+                                max_chunks_par_article=mca_eff,
+                                reranker=STATE["reranker"],
+                            )
                             nb_web_total_local = 0
                             if web_search_requested:
                                 query_ss = extraire_mots_cles_llm(query, llm)
@@ -1230,7 +1395,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="shint">VRAM-limited: 4GB&#8594;4096 &middot; 8GB&#8594;8192</div>
       </div>
     </div>
-
+    <hr class="s-sep">
+    <h3 style="font-size:1rem;margin-bottom:6px">🔀 Hybrid Search BM25 + Dense</h3>
+    <p style="font-size:0.78rem;color:var(--text2);margin-bottom:10px">
+      Combines keyword matching (BM25) with semantic search (E5). Higher BM25 weight
+      improves exact geographic/proper-noun recall. Requires <code>pip install rank-bm25</code>.
+    </p>
+    <div class="sfield">
+      <label>BM25 weight <span style="color:var(--accent2);font-size:0.7em">0 = dense only · 1 = BM25 only</span></label>
+      <input type="number" id="s-bm25-weight" placeholder="0.3" min="0" max="1" step="0.05" style="width:120px" />
+      <div class="shint">Recommended: 0.3 (70% dense / 30% BM25) — takes effect on next query, no restart needed</div>
+    </div>
 
     <div class="s-actions">
       <button class="s-btn primary" onclick="settingsSave()">💾 Save</button>
@@ -1249,6 +1424,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <p style="font-size:0.82rem;color:var(--text2);margin-bottom:12px">Indexes from the configured Zotero folder. Already-indexed articles are skipped.</p>
     <div class="s-actions">
       <button class="s-btn success" id="s-btn-ingest" onclick="settingsStartIngest()">▶ Start indexing</button>
+      <button class="s-btn secondary" onclick="openManageDB()" style="margin-top:8px">🗄️ Manage indexed articles</button>
     </div>
     <hr class="s-sep">
     <h3 style="font-size:1rem;margin-bottom:12px">🤖 Ollama Models</h3>
@@ -1258,6 +1434,35 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="s-actions" style="flex-wrap:wrap">
       <button class="s-btn secondary" onclick="settingsRefreshModels()">🔄 Refresh</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MANAGE DB MODAL ═══════════════════════════════════════════════════ -->
+<div id="manage-db-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:400;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:min(720px,96vw);max-height:88vh;display:flex;flex-direction:column;padding:24px;gap:14px">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h2 style="font-family:'DM Serif Display',serif;font-size:1.2rem;color:var(--accent)">🗄️ Manage indexed articles</h2>
+      <button onclick="closeManageDB()" style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:1.3rem;line-height:1">✕</button>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <input id="mdb-search" type="text" placeholder="Filter by filename, author, year…" oninput="filterManageDB()"
+        style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-family:'Figtree',sans-serif;font-size:0.85rem">
+      <span id="mdb-count" style="font-size:0.75rem;color:var(--text3);white-space:nowrap;font-family:'DM Mono',monospace"></span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button onclick="mdbSelectAll()" class="s-btn secondary" style="font-size:0.73rem;padding:4px 10px">☑ All</button>
+      <button onclick="mdbSelectNone()" class="s-btn secondary" style="font-size:0.73rem;padding:4px 10px">☐ None</button>
+      <span id="mdb-selected-count" style="font-size:0.75rem;color:var(--text3);margin-left:auto;font-family:'DM Mono',monospace">0 selected</span>
+    </div>
+    <div id="mdb-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:3px;min-height:0;max-height:420px;padding-right:4px">
+      <div style="color:var(--text3);font-size:0.85rem;padding:20px;text-align:center">Loading…</div>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--border);padding-top:14px;flex-wrap:wrap">
+      <button onclick="mdbDeleteSelected()" id="mdb-btn-delete"
+        style="background:#da3633;color:#fff;border:none;padding:8px 18px;border-radius:8px;font-size:0.85rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif;transition:opacity 0.2s"
+        disabled>🗑️ Delete from DB &amp; blacklist</button>
+      <span style="font-size:0.73rem;color:var(--text3);line-height:1.4">Deleted articles are added to the blacklist and won't be re-indexed.<br>Remove them from <code style="font-family:'DM Mono',monospace">refchat_ignore.txt</code> to re-enable them.</span>
     </div>
   </div>
 </div>
@@ -1838,6 +2043,7 @@ async function settingsOpen() {
   document.getElementById('s-num-gpu').value    = d.num_gpu    !== undefined ? d.num_gpu    : '';
   document.getElementById('s-num-batch').value  = d.num_batch  !== undefined ? d.num_batch  : '';
   document.getElementById('s-num-ctx-local').value = d.ollama_num_ctx_local !== undefined ? d.ollama_num_ctx_local : '';
+  document.getElementById('s-bm25-weight').value   = d.bm25_weight !== undefined ? d.bm25_weight : 0.3;
   document.getElementById('settings-modal').classList.add('open');
   settingsRefreshModels();
 }
@@ -1855,11 +2061,13 @@ async function settingsSave() {
   const numGpu    = document.getElementById('s-num-gpu').value.trim();
   const numBatch  = document.getElementById('s-num-batch').value.trim();
   const numCtxLocal = document.getElementById('s-num-ctx-local').value.trim();
+  const bm25Weight  = document.getElementById('s-bm25-weight').value.trim();
   const hwPayload = {};
   if (numThread) hwPayload.num_thread = parseInt(numThread);
   if (numGpu !== '') hwPayload.num_gpu = parseInt(numGpu);
   if (numBatch) hwPayload.num_batch = parseInt(numBatch);
   if (numCtxLocal) hwPayload.ollama_num_ctx_local = parseInt(numCtxLocal);
+  if (bm25Weight !== '') hwPayload.bm25_weight = parseFloat(bm25Weight);
   const r = await fetch('/api/config', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ zotero_path: zotero, mistral_api_key: apikey,
@@ -2415,6 +2623,104 @@ function setQueryTheme(theme) {
   queryInput.value = 'Resume les articles du theme ' + theme;
   queryInput.focus();
 }
+
+// ═══ MANAGE DB ══════════════════════════════════════════════════════════════
+let _mdbArticles = [];
+
+async function openManageDB() {
+  closeSettings();
+  const modal = document.getElementById('manage-db-modal');
+  modal.style.display = 'flex';
+  await loadManageDBArticles();
+}
+function closeManageDB() {
+  document.getElementById('manage-db-modal').style.display = 'none';
+}
+async function loadManageDBArticles() {
+  const listEl  = document.getElementById('mdb-list');
+  const countEl = document.getElementById('mdb-count');
+  listEl.innerHTML = '<div style="color:var(--text3);font-size:0.85rem;padding:20px;text-align:center">Loading…</div>';
+  try {
+    const d = await (await fetch('/api/db/articles')).json();
+    _mdbArticles = d.articles || [];
+    countEl.textContent = `${_mdbArticles.length} articles`;
+    renderManageDBList(_mdbArticles);
+  } catch(e) {
+    listEl.innerHTML = `<div style="color:#f85149;padding:12px">Error: ${e.message}</div>`;
+  }
+}
+function renderManageDBList(articles) {
+  const listEl = document.getElementById('mdb-list');
+  if (!articles.length) {
+    listEl.innerHTML = '<div style="color:var(--text3);font-size:0.85rem;padding:20px;text-align:center">No articles found</div>';
+    mdbUpdateCount(); return;
+  }
+  listEl.innerHTML = articles.map(a => {
+    const badge   = a.doc_type === 'thesis'
+      ? '<span style="background:#2a1a3a;color:#bc8cff;font-size:0.62rem;padding:1px 6px;border-radius:4px;margin-left:4px;font-family:\'DM Mono\',monospace">THESIS</span>' : '';
+    const label   = a.auteur ? `${a.auteur}${a.annee ? ' (' + a.annee + ')' : ''}` : a.filename;
+    const subline = a.auteur ? a.filename : (a.date || '');
+    return `<label style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:6px;cursor:pointer;border:1px solid transparent;transition:background 0.12s" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
+      <input type="checkbox" data-filename="${a.filename}" onchange="mdbUpdateCount()" style="width:15px;height:15px;accent-color:var(--accent);flex-shrink:0">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:0.82rem;color:var(--text);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${label}${badge}</div>
+        <div style="font-size:0.7rem;color:var(--text3);font-family:'DM Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${subline}</div>
+      </div>
+      <span style="font-size:0.68rem;color:var(--text3);white-space:nowrap;font-family:'DM Mono',monospace;flex-shrink:0">${a.nb_chunks} chunks</span>
+    </label>`;
+  }).join('');
+  mdbUpdateCount();
+}
+function filterManageDB() {
+  const q = document.getElementById('mdb-search').value.toLowerCase().trim();
+  const filtered = q ? _mdbArticles.filter(a =>
+    a.filename.toLowerCase().includes(q) ||
+    (a.auteur||'').toLowerCase().includes(q) ||
+    (a.annee||'').includes(q) ||
+    (a.titre||'').toLowerCase().includes(q)
+  ) : _mdbArticles;
+  renderManageDBList(filtered);
+  document.getElementById('mdb-count').textContent = q
+    ? `${filtered.length} / ${_mdbArticles.length} articles`
+    : `${_mdbArticles.length} articles`;
+}
+function mdbUpdateCount() {
+  const checked = document.querySelectorAll('#mdb-list input[type=checkbox]:checked');
+  document.getElementById('mdb-selected-count').textContent = `${checked.length} selected`;
+  document.getElementById('mdb-btn-delete').disabled = checked.length === 0;
+}
+function mdbSelectAll()  { document.querySelectorAll('#mdb-list input[type=checkbox]').forEach(cb => cb.checked = true);  mdbUpdateCount(); }
+function mdbSelectNone() { document.querySelectorAll('#mdb-list input[type=checkbox]').forEach(cb => cb.checked = false); mdbUpdateCount(); }
+
+async function mdbDeleteSelected() {
+  const checked   = document.querySelectorAll('#mdb-list input[type=checkbox]:checked');
+  const filenames = Array.from(checked).map(cb => cb.dataset.filename);
+  if (!filenames.length) return;
+  if (!confirm(`Delete ${filenames.length} article(s) from the database and blacklist them?\nThis cannot be undone without re-indexing.`)) return;
+
+  const btn = document.getElementById('mdb-btn-delete');
+  btn.disabled = true; btn.textContent = '⏳ Deleting…';
+  try {
+    const d = await (await fetch('/api/db/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filenames})
+    })).json();
+    if (d.success || d.deleted > 0) {
+      showToast(`🗑️ ${d.deleted} article(s) deleted and blacklisted`);
+      await loadManageDBArticles();
+    } else {
+      showToast('❌ ' + (d.errors||[]).join(', '), true);
+    }
+  } catch(e) {
+    showToast('❌ Network error: ' + e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = '🗑️ Delete from DB & blacklist';
+    mdbUpdateCount();
+  }
+}
+document.getElementById('manage-db-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('manage-db-modal')) closeManageDB();
+});
 
 window.addEventListener('load', async () => {
   try {

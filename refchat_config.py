@@ -4,15 +4,19 @@
 # ============================================================
 import os, json, pathlib
 
-_DIR      = pathlib.Path(__file__).parent.resolve()
-_CFG_FILE = _DIR / "refchat_config.json"
+_DIR          = pathlib.Path(__file__).parent.resolve()
+PERSONAL_DATA = _DIR / "personal_data"
+PERSONAL_DATA.mkdir(exist_ok=True)
+
+_CFG_FILE = PERSONAL_DATA / "refchat_config.json"
 
 _DEFAULTS = {
     "zotero_path":              "",
-    "db_path":                  str(_DIR / "chroma_db"),
+    "db_path":                  str(PERSONAL_DATA / "chroma_db"),
     "llm_model":                "mistral-large-latest",
     "mistral_api_key":          "",
     "semantic_scholar_api_key": "",
+    "bm25_weight":              0.3,   # poids BM25 dans le hybrid search (0 = dense pur, 1 = BM25 pur)
 }
 
 def _load():
@@ -44,7 +48,7 @@ EMBEDDING_MODEL   = "intfloat/multilingual-e5-large"
 E5_QUERY_PREFIX   = "query: "
 E5_PASSAGE_PREFIX = "passage: "
 
-DB_PATH   = _cfg.get("db_path",   str(_DIR / "chroma_db"))
+DB_PATH   = _cfg.get("db_path",   str(PERSONAL_DATA / "chroma_db"))
 LLM_MODEL = _cfg.get("llm_model", "mistral-light")
 
 OLLAMA_TEMPERATURE = 0.1   # valeur par défaut (rétrocompatibilité)

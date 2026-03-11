@@ -91,7 +91,7 @@ if exist "%DEPS_STAMP%" (
     goto deps_done
 )
 
-"%VENV_PYTHON%" -c "import flask, langchain_chroma, langchain_huggingface, chromadb, fitz, sentence_transformers" >nul 2>&1
+"%VENV_PYTHON%" -c "import flask, langchain_chroma, langchain_huggingface, chromadb, fitz, sentence_transformers, rank_bm25" >nul 2>&1
 if %ERRORLEVEL%==0 goto deps_mark_ok
 
 :: -- Full installation (first time or after stamp deletion) --
@@ -116,8 +116,8 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
-echo    Installing sentence-transformers + tqdm...
-"%VENV_PYTHON%" -m pip install sentence-transformers tqdm --quiet --no-warn-script-location
+echo    Installing sentence-transformers + tqdm + rank-bm25...
+"%VENV_PYTHON%" -m pip install sentence-transformers tqdm rank-bm25 --quiet --no-warn-script-location
 if %ERRORLEVEL% NEQ 0 (
     echo    ERROR sentence-transformers.
     pause
@@ -126,11 +126,17 @@ if %ERRORLEVEL% NEQ 0 (
 
 "%VENV_PYTHON%" -c "import torch" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo    Installing PyTorch CPU...
-    "%VENV_PYTHON%" -m pip install torch --index-url https://download.pytorch.org/whl/cpu --quiet
+    nvidia-smi >nul 2>&1
+    if %ERRORLEVEL%==0 (
+        echo    NVIDIA GPU detected — Installing PyTorch CUDA 12.1...
+        "%VENV_PYTHON%" -m pip install torch --index-url https://download.pytorch.org/whl/cu121 --quiet --no-warn-script-location
+    ) else (
+        echo    Installing PyTorch CPU...
+        "%VENV_PYTHON%" -m pip install torch --index-url https://download.pytorch.org/whl/cpu --quiet --no-warn-script-location
+    )
 )
 
-"%VENV_PYTHON%" -c "import flask, langchain_chroma, langchain_huggingface, chromadb, fitz, sentence_transformers" >nul 2>&1
+"%VENV_PYTHON%" -c "import flask, langchain_chroma, langchain_huggingface, chromadb, fitz, sentence_transformers, rank_bm25" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo    ERROR: packages still missing after installation.
     pause

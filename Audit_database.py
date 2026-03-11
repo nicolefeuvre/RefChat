@@ -15,7 +15,7 @@ from langchain_core.documents import Document
 import refchat_config as cfg
 
 # File to store names of manually modified PDFs
-AUDIT_LOG_FILE = pathlib.Path(__file__).parent / "audit_modifications.json"
+AUDIT_LOG_FILE = cfg.PERSONAL_DATA / "audit_modifications.json"
 
 def load_audit_log():
     if AUDIT_LOG_FILE.exists():
