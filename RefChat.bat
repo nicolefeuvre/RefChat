@@ -101,7 +101,7 @@ echo    Do not close this window.
 "%VENV_PYTHON%" -m pip install --upgrade pip --quiet
 
 echo    Installing Flask + LangChain...
-"%VENV_PYTHON%" -m pip install flask langchain langchain-community langchain-chroma langchain-huggingface langchain-ollama langchain-mistralai langchain-text-splitters pypdf --quiet --no-warn-script-location
+"%VENV_PYTHON%" -m pip install flask langchain langchain-community langchain-chroma langchain-huggingface langchain-ollama langchain-mistralai langchain-text-splitters pypdf beautifulsoup4 lxml --quiet --no-warn-script-location
 if %ERRORLEVEL% NEQ 0 (
     echo    ERROR Flask/LangChain.
     pause

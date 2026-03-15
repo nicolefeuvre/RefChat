@@ -247,6 +247,7 @@ def recuperer_articles_par_theme(db, theme, max_articles=6, max_chunks_par_artic
 
 
 def detecter_theme_query(query, themes_disponibles):
+    """Détection par mots-clés (rapide, utilisé comme fallback)."""
     if not themes_disponibles:
         return None
     import re
@@ -263,6 +264,48 @@ def detecter_theme_query(query, themes_disponibles):
         first_word = t.split(" - ")[0].lower()
         if len(first_word) > 4 and first_word in q_lower:
             return t
+    return None
+
+
+def detecter_theme_semantique(query: str, themes_disponibles: list, emb_fn,
+                               threshold: float = 0.52) -> str | None:
+    """
+    Détection sémantique du thème par similarité cosine entre la requête
+    et les noms de thèmes (embedding).
+
+    Args:
+        query:              question de l'utilisateur
+        themes_disponibles: liste de noms de thèmes
+        emb_fn:             fonction d'embedding (ex. STATE["db"].embedding_function)
+        threshold:          score minimum pour déclencher le filtre (défaut 0.52)
+
+    Returns:
+        Nom du thème le plus proche si score >= threshold, sinon None.
+    """
+    if not themes_disponibles or emb_fn is None:
+        return None
+    try:
+        import numpy as np
+        # Préfixe E5 si modèle E5
+        use_e5 = "e5" in EMBEDDING_MODEL.lower()
+        q_text = f"query: {query}" if use_e5 else query
+        t_texts = [f"passage: {t}" if use_e5 else t for t in themes_disponibles]
+
+        q_emb  = np.array(emb_fn.embed_query(q_text), dtype=np.float32)
+        t_embs = np.array(emb_fn.embed_documents(t_texts), dtype=np.float32)
+
+        # Cosine similarity vectorisée
+        q_norm = np.linalg.norm(q_emb) + 1e-9
+        t_norm = np.linalg.norm(t_embs, axis=1) + 1e-9
+        scores = (t_embs @ q_emb) / (t_norm * q_norm)
+
+        best_idx   = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
+
+        if best_score >= threshold:
+            return themes_disponibles[best_idx]
+    except Exception:
+        pass
     return None
 
 MAX_CHUNKS_THESIS = 5   # plafond chunks pour thèses (vs max_chunks_par_article pour articles)
@@ -803,7 +846,7 @@ PROMPT_QUESTION = ChatPromptTemplate.from_messages([
      "1. INTRODUCTION: A natural prose paragraph setting the context before going into details.\n"
      "2. IN-TEXT CITATIONS: Integrate sources directly into your narrative as (Author et al., Year).\n"
      "3. EXHAUSTIVE COVERAGE: You are OBLIGATED to use information from EVERY author mentioned in the context.\n"
-     "4. VISUAL STRUCTURE: Titles in UPPERCASE with thematic emoji. Underline EACH title with long dashes: ────────────────────────. NEVER use '##'.\n"
+     "4. VISUAL STRUCTURE: Titles in UPPERCASE with thematic emoji. After each title, add exactly this separator on the next line (copy verbatim, never shorter or longer): ──────────────────────────────────────. NEVER use '##'.\n"
      "5. CONTENT: Write EXCLUSIVELY in continuous narrative prose. ABSOLUTE PROHIBITION on bullet points (-, *, •) anywhere in the response. Numbered lists (1. 2. 3.) are allowed ONLY for ranked steps or structured plans. Measurements and data must be integrated into sentences, not listed.\n"
      "6. STRICT SOURCES: Only cite authors explicitly present in the provided context. ABSOLUTE PROHIBITION on using training knowledge to add references. If an author is not in the context, they do not exist for this answer.\n"
      "7. WEB DISTINCTION: Only if an excerpt's section is 'Web Search', add '[Web Source]' after the citation. Never add it on your own initiative.\n"
@@ -826,7 +869,7 @@ PROMPT_RESUME = ChatPromptTemplate.from_messages([
      "GOLDEN RULES:\n"
      "1. SYNTHESIS: Do not summarize article by article. Weave a logical narrative where ideas respond to each other.\n"
      "2. CITATIONS: Use the format (Author et al., Year) at the heart of your sentences to attribute findings.\n"
-     "3. VISUAL: Titles in UPPERCASE + Emoji + Separator line: ────────────────────────. No '##'. Numbered sections (1. 2. 3.) are encouraged for structure.\n"
+     "3. VISUAL: Titles in UPPERCASE + Emoji + add exactly this separator after each title (copy verbatim): ──────────────────────────────────────. No '##'. Numbered sections (1. 2. 3.) are encouraged for structure.\n"
      "4. RICHNESS: Preserve all technical measurements and geological structure names.\n"
      "4b. PROSE ONLY: Write in continuous narrative prose. ABSOLUTE PROHIBITION on bullet points (-, *, •) anywhere. Data and measurements must be integrated into sentences, not listed.\n"
      "5. STRICT SOURCES: Only cite authors present in the provided context. ABSOLUTE PROHIBITION on adding references from training knowledge.\n"

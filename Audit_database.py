@@ -1,8 +1,13 @@
 """
 Full audit tool: Missing abstracts + Corrupted metadata + Deletion.
 (Version with registry to prevent re-indexing of manually modified files)
+
+Usage:
+  python Audit_database.py              # interactive mode
+  python Audit_database.py --auto       # auto-fix missing abstracts (no prompts)
 """
 import os
+import sys
 import json
 import warnings
 import pathlib
@@ -29,6 +34,107 @@ def load_audit_log():
 def save_audit_log(modified_files):
     with open(AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
         json.dump(list(modified_files), f, indent=4)
+
+def _find_pdf(fname, zotero_path):
+    """Search for a PDF by filename in the Zotero storage folder."""
+    if not zotero_path or not os.path.isdir(zotero_path):
+        return None
+    for root, _, files in os.walk(zotero_path):
+        if fname in files:
+            return os.path.join(root, fname)
+    return None
+
+
+def auto_fix_abstracts(db, zotero_path=None, log_callback=None):
+    """Scan DB for articles missing an Abstract chunk and auto-inject one.
+
+    Uses the same 3-level cascade as the ingest pipeline:
+      1. Regex pattern matching on raw PDF text
+      2. First-page proxy (first substantial content)
+    Returns (fixed, skipped, not_found) counts.
+    """
+    from refchat_ingest import _extract_abstract_from_raw, _first_page_proxy
+
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+
+    zotero_path = zotero_path or cfg.get("zotero_path", "")
+
+    _log("🔍 Scanning database for articles without Abstract chunk…")
+    total = db._collection.count()
+    metadatas = []
+    for offset in range(0, total, 2000):
+        r = db._collection.get(limit=2000, offset=offset, include=["metadatas"])
+        metadatas.extend(r["metadatas"])
+
+    all_files           = {}
+    files_with_abstract = set()
+    for m in metadatas:
+        if not m: continue
+        fname = m.get("filename")
+        if not fname: continue
+        if fname not in all_files:
+            all_files[fname] = m
+        if m.get("section") == "Abstract":
+            files_with_abstract.add(fname)
+
+    missing = sorted(set(all_files.keys()) - files_with_abstract)
+    _log(f"   {len(all_files)} articles total — {len(missing)} without Abstract")
+
+    if not missing:
+        _log("✅ All articles already have an Abstract chunk.")
+        return 0, 0, 0
+
+    fixed = skipped = not_found = 0
+
+    for fname in missing:
+        pdf_path = _find_pdf(fname, zotero_path)
+        if not pdf_path:
+            _log(f"   ⚠️  PDF not found: {fname}")
+            not_found += 1
+            continue
+
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(pdf_path)
+            raw_text = "".join(page.get_text() for page in doc)
+            doc.close()
+        except Exception as e:
+            _log(f"   ❌ Cannot read {fname}: {e}")
+            skipped += 1
+            continue
+
+        # Level 1: regex
+        abstract = _extract_abstract_from_raw(raw_text)
+        method = "regex"
+        # Level 2: first-page proxy
+        if not abstract:
+            abstract = _first_page_proxy(raw_text)
+            method = "proxy"
+
+        if not abstract:
+            _log(f"   ⚠️  No abstract extractable: {fname}")
+            skipped += 1
+            continue
+
+        # Inject Abstract chunk into ChromaDB
+        base_meta = all_files[fname].copy()
+        base_meta["section"] = "Abstract"
+        base_meta["source_ajout"] = f"audit-auto-{method}"
+
+        is_e5 = "e5" in cfg.EMBEDDING_MODEL.lower()
+        text_to_embed = f"passage: {abstract}" if is_e5 else abstract
+
+        db.add_documents([Document(page_content=text_to_embed, metadata=base_meta)])
+        _log(f"   ✅ [{method}] Abstract injected: {fname} ({len(abstract)} chars)")
+        fixed += 1
+
+    _log(f"\n📊 Auto-fix done: {fixed} fixed, {skipped} skipped, {not_found} PDFs not found")
+    return fixed, skipped, not_found
+
 
 def main():
     print("⏳ Loading database...")
@@ -194,4 +300,23 @@ def main():
         print(f"\n💾 Audit registry updated ({len(newly_modified)} modifications saved).")
 
 if __name__ == "__main__":
-    main()
+    if "--auto" in sys.argv:
+        # Non-interactive mode: auto-fix missing abstracts only
+        print("⏳ Loading database…")
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+        embedding_func = HuggingFaceEmbeddings(
+            model_name=cfg.EMBEDDING_MODEL,
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+        db = Chroma(
+            persist_directory=cfg.get("db_path", str(cfg.PERSONAL_DATA / "chroma_db")),
+            embedding_function=embedding_func
+        )
+        auto_fix_abstracts(db)
+    else:
+        main()

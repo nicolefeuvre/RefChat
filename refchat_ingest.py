@@ -423,6 +423,77 @@ def chunk_section(section_name, section_text, metadata_base, splitter):
     docs = splitter.create_documents([text], metadatas=[{**metadata_base, "section": section_name}])
     return [d for d in docs if not _is_parasite_chunk(d.page_content)]
 
+# Regex to detect abstract header + body in raw PDF text (used when GROBID fails)
+_ABSTRACT_HEADER_RE = re.compile(
+    r'(?:^|\n)\s*(?:ABSTRACT|Abstract|RÉSUMÉ|Résumé|résumé|RESUME|Summary|SUMMARY)\s*[:\-—]?\s*\n+'
+    r'([\s\S]{100,2500}?)'
+    r'(?=\n\s*(?:\d[\.\s]|Introduction|INTRODUCTION|Keywords|KEYWORDS|'
+    r'Mots[- ]clés|Index[- ]terms|Background|BACKGROUND|\n\n\n))',
+    re.MULTILINE
+)
+# Simpler fallback: "Abstract" on same line as text (no newline between header and body)
+_ABSTRACT_INLINE_RE = re.compile(
+    r'(?:^|\n)\s*(?:ABSTRACT|Abstract|RÉSUMÉ|Résumé|Summary)[:\s\-—]+([A-Z][^#\n]{100,2500}?)(?=\n\s*\n)',
+    re.MULTILINE
+)
+
+def _extract_abstract_from_raw(text):
+    """Regex fallback: tries to find the abstract in raw PDF text. Returns '' if not found."""
+    sample = text[:6000]
+    for pattern in (_ABSTRACT_HEADER_RE, _ABSTRACT_INLINE_RE):
+        m = pattern.search(sample)
+        if m:
+            abstract = m.group(1).strip()
+            if len(abstract) >= 100:
+                return abstract
+    return ""
+
+
+def _first_page_proxy(text, min_chars=200, target_chars=1200):
+    """Last-resort proxy: take the first meaningful content lines as a proxy abstract.
+    Skips short header lines (title, authors, journal, DOI) and returns the first
+    substantial paragraph-like content. Works even on poor OCR / scanned PDFs."""
+    lines = text.split('\n')
+    content_lines = []
+    total = 0
+    for line in lines:
+        stripped = line.strip()
+        # Skip short lines (headers, page numbers, DOI lines, etc.)
+        if len(stripped) < 40:
+            continue
+        # Stop at obvious section headers
+        if re.match(r'^(?:\d[\.\s]|Introduction|INTRODUCTION|Methods|METHODS|Keywords)', stripped):
+            break
+        content_lines.append(stripped)
+        total += len(stripped)
+        if total >= target_chars:
+            break
+    result = ' '.join(content_lines)
+    return result[:target_chars] if len(result) >= min_chars else ""
+
+
+def _get_abstract(doc_structure, raw_text):
+    """3-level abstract extraction: GROBID → regex → first-page proxy.
+    Returns (abstract_text, method_label)."""
+    # Level 1: GROBID
+    if doc_structure:
+        abstract = doc_structure.get("Abstract", "")
+        if abstract and len(abstract) >= 100:
+            return abstract, "GROBID"
+
+    # Level 2: regex on raw text
+    abstract = _extract_abstract_from_raw(raw_text)
+    if abstract:
+        return abstract, "regex"
+
+    # Level 3: first-page proxy (always works if text is readable)
+    abstract = _first_page_proxy(raw_text)
+    if abstract:
+        return abstract, "proxy"
+
+    return "", "none"
+
+
 def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
     doc_structure, status = extract_sections_grobid(pdf_path)
     chunks = []
@@ -430,10 +501,11 @@ def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
     if doc_structure:
         found_sections = []
 
-        abstract = doc_structure.get("Abstract", "")
+        # Get abstract via 3-level cascade
+        abstract, method = _get_abstract(doc_structure, raw_text_fallback)
         if abstract:
             chunks.extend(chunk_section("Abstract", abstract, metadata_base, splitter))
-            found_sections.append("Abstract")
+            found_sections.append(f"Abstract[{method}]")
 
         for sec in doc_structure.get("Sections", []):
             title = sec["titre"]
@@ -455,6 +527,15 @@ def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
 
     _log(f"      🟡 [FALLBACK] GROBID failed/empty ({status}). Using raw text.")
     cleaned_text = _trim_references_at_end(raw_text_fallback)
+
+    abstract, method = _get_abstract(None, cleaned_text)
+    if abstract:
+        _log(f"      📋 [FALLBACK] Abstract via {method} ({len(abstract)} chars)")
+        chunks = chunk_section("Abstract", abstract, metadata_base, splitter)
+        chunks.extend(chunk_section("Full text", cleaned_text, metadata_base, splitter))
+        return chunks, True, status
+
+    _log(f"      ⚠️ [FALLBACK] No abstract found — Full text only")
     return chunk_section("Full text", cleaned_text, metadata_base, splitter), True, status
 
 # ============================================================

@@ -29,7 +29,8 @@ from refchat_llm import (
     chercher_semantic_scholar,
     format_docs, expand_query, charger_llm, charger_bm25,
     extraire_mots_cles_llm,
-    lister_themes, recuperer_articles_par_theme, detecter_theme_query,
+    lister_themes, recuperer_articles_par_theme,
+    detecter_theme_query, detecter_theme_semantique,
 )
 import refchat_config as cfg
 
@@ -53,6 +54,22 @@ STATE = {
     "theme_log":     [],
     "theme_done":    False,
     "theme_error":   None,
+    # Thématisation — prévisualisation (dry-run)
+    "theme_preview_running": False,
+    "theme_preview_done":    False,
+    "theme_preview_log":     [],
+    "theme_preview_error":   None,
+    "theme_preview_result":  None,   # dict retourné par run_clustering_preview()
+    # Thématisation — validation (écriture DB)
+    "theme_validate_running": False,
+    "theme_validate_done":    False,
+    "theme_validate_log":     [],
+    "theme_validate_error":   None,
+    # Audit
+    "audit_running": False,
+    "audit_log":     [],
+    "audit_done":    False,
+    "audit_error":   None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -224,6 +241,179 @@ def api_theme_status():
         "log":     STATE["theme_log"][-100:],
     })
 
+
+# ── Thématisation : prévisualisation (dry-run) ─────────────────────────────────
+
+@app.route("/api/theme/preview", methods=["POST"])
+def api_theme_preview():
+    """Lance le clustering BERTopic en mode dry-run et retourne la prévisualisation."""
+    if STATE["theme_preview_running"]:
+        return jsonify({"success": False, "error": "Prévisualisation déjà en cours"})
+    db = STATE["db"]
+    if not db:
+        return jsonify({"success": False, "error": "Base non initialisée"})
+    data     = request.get_json() or {}
+    n_topics = data.get("n_topics") or None
+    min_docs = int(data.get("min_docs", 5))
+    STATE.update({
+        "theme_preview_running": True,
+        "theme_preview_done":    False,
+        "theme_preview_log":     [],
+        "theme_preview_error":   None,
+        "theme_preview_result":  None,
+    })
+    def run():
+        try:
+            import refchat_theme as _rt
+            def log_cb(msg):
+                STATE["theme_preview_log"].append(str(msg))
+            result = _rt.run_clustering_preview(
+                db=db, n_topics=n_topics, min_docs=min_docs, log_cb=log_cb
+            )
+            if "error" in result:
+                STATE["theme_preview_error"] = result["error"]
+            else:
+                STATE["theme_preview_result"] = result
+        except Exception as e:
+            STATE["theme_preview_error"] = str(e)
+        finally:
+            STATE["theme_preview_running"] = False
+            STATE["theme_preview_done"]    = True
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route("/api/theme/preview/status")
+def api_theme_preview_status():
+    return jsonify({
+        "running": STATE["theme_preview_running"],
+        "done":    STATE["theme_preview_done"],
+        "error":   STATE["theme_preview_error"],
+        "log":     STATE["theme_preview_log"][-100:],
+        "result":  STATE["theme_preview_result"],   # None tant que pas terminé
+    })
+
+
+# ── Thématisation : validation (écriture DB) ──────────────────────────────────
+
+@app.route("/api/theme/validate", methods=["POST"])
+def api_theme_validate():
+    """Écrit un mapping filename→thème validé par l'utilisateur dans ChromaDB."""
+    if STATE["theme_validate_running"]:
+        return jsonify({"success": False, "error": "Validation déjà en cours"})
+    db = STATE["db"]
+    if not db:
+        return jsonify({"success": False, "error": "Base non initialisée"})
+    data = request.get_json() or {}
+    filename_to_theme = data.get("filename_to_theme")
+    if not filename_to_theme:
+        return jsonify({"success": False, "error": "Paramètre filename_to_theme manquant"})
+    STATE.update({
+        "theme_validate_running": True,
+        "theme_validate_done":    False,
+        "theme_validate_log":     [],
+        "theme_validate_error":   None,
+    })
+    def run():
+        try:
+            import refchat_theme as _rt
+            def log_cb(msg):
+                STATE["theme_validate_log"].append(str(msg))
+            _rt.apply_theme_mapping(filename_to_theme, db=db, log_cb=log_cb)
+        except Exception as e:
+            STATE["theme_validate_error"] = str(e)
+        finally:
+            STATE["theme_validate_running"] = False
+            STATE["theme_validate_done"]    = True
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route("/api/theme/validate/status")
+def api_theme_validate_status():
+    return jsonify({
+        "running": STATE["theme_validate_running"],
+        "done":    STATE["theme_validate_done"],
+        "error":   STATE["theme_validate_error"],
+        "log":     STATE["theme_validate_log"][-100:],
+    })
+
+
+# ── Thèmes avec liste d'articles (pour sidebar accordéon) ────────────────────
+
+@app.route("/api/themes/articles")
+def api_themes_articles():
+    """
+    Retourne les thèmes avec leur liste d'articles — lit depuis refchat_themes.json
+    si disponible (rapide), sinon scanne ChromaDB.
+    """
+    import refchat_config as _cfg
+    map_path = pathlib.Path(_cfg.PERSONAL_DATA) / "refchat_themes.json"
+    try:
+        if map_path.exists():
+            with open(map_path, encoding="utf-8") as f:
+                data = json.load(f)
+            theme_map    = data.get("theme_map", {})       # fname→theme
+            themes_dict  = data.get("themes", {})          # theme→[fnames]
+            # Enrichir avec métadonnées depuis ChromaDB si dispo
+            db = STATE["db"]
+            meta_cache: dict = {}
+            if db:
+                try:
+                    total = db._collection.count()
+                    for offset in range(0, min(total, 10000), 2000):
+                        r = db._collection.get(
+                            limit=2000, offset=offset, include=["metadatas"]
+                        )
+                        for m in r["metadatas"]:
+                            fname = m.get("filename", "")
+                            if fname and fname not in meta_cache:
+                                meta_cache[fname] = m
+                except Exception:
+                    pass
+            themes_out = []
+            for theme, fnames in sorted(themes_dict.items(), key=lambda x: -len(x[1])):
+                articles = []
+                for fname in fnames:
+                    m = meta_cache.get(fname, {})
+                    articles.append({
+                        "fname":  fname,
+                        "auteur": m.get("auteur", ""),
+                        "annee":  m.get("annee",  ""),
+                        "titre":  m.get("titre",  ""),
+                    })
+                themes_out.append({"name": theme, "count": len(fnames), "articles": articles})
+            return jsonify({"themes": themes_out, "source": "json"})
+    except Exception:
+        pass
+
+    # Fallback : scan ChromaDB
+    db = STATE["db"]
+    if not db:
+        return jsonify({"themes": [], "error": "Base non initialisée"})
+    try:
+        total = db._collection.count()
+        theme_articles: dict = {}
+        for offset in range(0, total, 2000):
+            r = db._collection.get(limit=2000, offset=offset, include=["metadatas"])
+            for m in r["metadatas"]:
+                t = m.get("theme", "")
+                if not t:
+                    continue
+                fname = m.get("filename", "")
+                if fname and fname not in theme_articles.get(t, {}):
+                    theme_articles.setdefault(t, {})[fname] = m
+        themes_out = []
+        for theme, art_dict in sorted(theme_articles.items(), key=lambda x: -len(x[1])):
+            articles = [
+                {"fname": f, "auteur": m.get("auteur",""), "annee": m.get("annee",""),
+                 "titre": m.get("titre","")}
+                for f, m in art_dict.items()
+            ]
+            themes_out.append({"name": theme, "count": len(articles), "articles": articles})
+        return jsonify({"themes": themes_out, "source": "chromadb"})
+    except Exception as e:
+        return jsonify({"themes": [], "error": str(e)})
 
 
 @app.route("/api/hardware/detect")
@@ -661,6 +851,44 @@ def api_ingest_status():
         "log":     STATE["ingest_log"][-150:],
     })
 
+@app.route("/api/audit/fix-abstracts", methods=["POST"])
+def api_audit_fix_abstracts():
+    if STATE["audit_running"]:
+        return jsonify({"success": False, "error": "Audit already in progress"})
+    if not STATE["db"]:
+        return jsonify({"success": False, "error": "Database not loaded — start the app first"})
+
+    STATE.update({"audit_running": True, "audit_log": [],
+                  "audit_done": False, "audit_error": None})
+
+    def run():
+        try:
+            from Audit_database import auto_fix_abstracts
+            zotero_path = cfg.get("zotero_path", "")
+
+            def log_cb(msg):
+                STATE["audit_log"].append(msg.rstrip())
+
+            auto_fix_abstracts(STATE["db"], zotero_path=zotero_path, log_callback=log_cb)
+            STATE["audit_done"] = True
+        except Exception as e:
+            STATE["audit_error"] = str(e)
+            STATE["audit_done"]  = True
+        finally:
+            STATE["audit_running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+@app.route("/api/audit/status")
+def api_audit_status():
+    return jsonify({
+        "running": STATE["audit_running"],
+        "done":    STATE["audit_done"],
+        "error":   STATE["audit_error"],
+        "log":     STATE["audit_log"][-150:],
+    })
+
 @app.route("/api/init", methods=["POST"])
 def api_init():
     data   = request.json or {}
@@ -721,7 +949,8 @@ def api_chat():
     
     data = request.json or {}
     query = data.get("query", "").strip()
-    web_search_requested = data.get("web_search", False)
+    web_search_requested  = data.get("web_search", False)
+    active_theme_filter   = data.get("active_theme_filter") or None  # filtre persistant sidebar
     
     if not query:
         return jsonify({"error": "Question vide."}), 400
@@ -749,9 +978,17 @@ def api_chat():
 
             def _run_rag():
                 try:
-                    # -- Detection de theme --
-                    themes_dispo  = lister_themes(db)
-                    theme_detecte = detecter_theme_query(query, themes_dispo)
+                    # -- Détection de thème --
+                    # Priorité : 1. filtre actif (clic sidebar) → 2. sémantique → 3. mots-clés
+                    themes_dispo = lister_themes(db)
+                    if active_theme_filter:
+                        theme_detecte = active_theme_filter
+                    else:
+                        emb_fn = getattr(db, "embedding_function", None)
+                        theme_detecte = (
+                            detecter_theme_semantique(query, themes_dispo, emb_fn)
+                            or detecter_theme_query(query, themes_dispo)
+                        )
 
                     if mode == "auteur":
                         nom = extraire_nom_auteur(query)
@@ -796,6 +1033,7 @@ def api_chat():
                                 k_initial=k_initial_val, max_articles=ma_eff,
                                 max_chunks_par_article=mca_eff,
                                 reranker=STATE["reranker"],
+                                theme_filter=theme_detecte,  # filtre thématique silencieux
                             )
                             nb_web_total_local = 0
                             if web_search_requested:
@@ -1028,6 +1266,69 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .action-btn.danger:hover { border-color:#f85149; color:#f85149; }
 
   @media (max-width:700px) { #sidebar { display:none; } }
+
+  /* Sidebar — accordéon thèmes */
+  .theme-accordion-item { border:1px solid var(--border); border-radius:7px; margin-bottom:4px; overflow:hidden; }
+  .theme-accordion-header { display:flex; align-items:center; justify-content:space-between; padding:6px 9px; cursor:pointer; background:var(--bg3); transition:background 0.15s; gap:6px; }
+  .theme-accordion-header:hover { background:#1e2a1e; }
+  .theme-accordion-header.active { background:#1a2a1a; border-bottom:1px solid var(--border); }
+  .theme-acc-name { font-size:0.72rem; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+  .theme-acc-count { font-size:0.65rem; color:var(--text3); font-family:'DM Mono',monospace; flex-shrink:0; }
+  .theme-acc-chevron { font-size:0.6rem; color:var(--text3); flex-shrink:0; transition:transform 0.2s; }
+  .theme-accordion-body { display:none; padding:4px 6px; max-height:180px; overflow-y:auto; }
+  .theme-acc-art { font-size:0.68rem; color:var(--text2); padding:3px 4px; border-radius:4px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .theme-acc-art:hover { background:var(--bg3); color:var(--accent2); }
+  .theme-acc-filter-btn { display:block; width:100%; margin-top:4px; background:transparent; border:1px solid var(--border); color:var(--accent2); font-size:0.68rem; padding:3px 6px; border-radius:4px; cursor:pointer; font-family:'Figtree',sans-serif; }
+  .theme-acc-filter-btn:hover { background:#1a2a1a; }
+
+  /* Badge filtre actif */
+  #active-filter-bar { display:none; align-items:center; gap:8px; padding:5px 16px; background:#0d1f17; border-bottom:1px solid var(--accent2); font-size:0.75rem; color:var(--accent2); }
+  #active-filter-bar .af-label { flex:1; }
+  #active-filter-bar .af-clear { background:transparent; border:none; color:var(--accent2); cursor:pointer; font-size:0.85rem; padding:0 4px; opacity:0.7; }
+  #active-filter-bar .af-clear:hover { opacity:1; }
+
+  /* Modal validation thèmes */
+  #theme-validate-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:300; align-items:flex-start; justify-content:center; padding-top:40px; overflow-y:auto; }
+  .tv-box { background:var(--bg2); border:1px solid var(--border); border-radius:14px; width:780px; max-width:96vw; margin:0 auto 40px; display:flex; flex-direction:column; max-height:88vh; }
+  .tv-header { display:flex; align-items:center; justify-content:space-between; padding:18px 24px 12px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .tv-title { font-family:'DM Serif Display',serif; font-size:1.3rem; color:var(--text); }
+  .tv-stats { font-size:0.75rem; color:var(--text3); font-family:'DM Mono',monospace; }
+  .tv-close { background:transparent; border:none; color:var(--text3); font-size:1.2rem; cursor:pointer; }
+  .tv-actions { display:flex; gap:8px; padding:10px 24px; border-bottom:1px solid var(--border); flex-shrink:0; flex-wrap:wrap; align-items:center; }
+  .tv-btn { padding:6px 14px; border-radius:7px; font-size:0.78rem; cursor:pointer; font-family:'Figtree',sans-serif; }
+  .tv-btn-primary { background:var(--accent2); color:#0d1117; border:none; font-weight:600; }
+  .tv-btn-primary:hover { opacity:0.85; }
+  .tv-btn-secondary { background:transparent; border:1px solid var(--border); color:var(--text2); }
+  .tv-btn-secondary:hover { border-color:var(--accent); color:var(--text); }
+  .tv-btn-danger { background:transparent; border:1px solid #f85149; color:#f85149; }
+  .tv-btn-danger:hover { background:#f8514922; }
+  .tv-issues-bar { padding:6px 24px; font-size:0.73rem; background:#1a1200; color:#ffa657; border-bottom:1px solid #3a2a00; flex-shrink:0; }
+  .tv-list { flex:1; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; }
+  .tv-card { background:var(--bg3); border:1px solid var(--border); border-radius:9px; padding:10px 12px; }
+  .tv-card.has-issues { border-color:#ffa65744; }
+  .tv-card.is-parasitic { border-color:#f8514944; }
+  .tv-card.is-deleted { opacity:0.4; }
+  .tv-card-top { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .tv-name-input { flex:1; background:var(--bg2); border:1px solid var(--border); color:var(--text); font-size:0.82rem; padding:5px 9px; border-radius:6px; font-family:'Figtree',sans-serif; min-width:0; }
+  .tv-name-input:focus { outline:2px solid var(--accent); border-color:transparent; }
+  .tv-count-badge { font-size:0.68rem; color:var(--text3); font-family:'DM Mono',monospace; white-space:nowrap; flex-shrink:0; }
+  .tv-del-btn { background:transparent; border:1px solid var(--border); color:var(--text3); border-radius:5px; width:28px; height:28px; cursor:pointer; font-size:0.85rem; flex-shrink:0; }
+  .tv-del-btn:hover { border-color:#f85149; color:#f85149; }
+  .tv-restore-btn { background:transparent; border:1px solid var(--border); color:var(--accent2); border-radius:5px; padding:2px 8px; font-size:0.72rem; cursor:pointer; }
+  .tv-issue-badges { display:flex; gap:4px; flex-wrap:wrap; margin-bottom:4px; }
+  .tv-issue-badge { font-size:0.62rem; padding:1px 7px; border-radius:3px; }
+  .tv-issue-badge.parasitic { background:#f8514922; color:#f85149; }
+  .tv-issue-badge.small     { background:#bc8cff22; color:#bc8cff; }
+  .tv-issue-badge.large     { background:#ffa65722; color:#ffa657; }
+  .tv-issue-badge.generic   { background:#58a6ff22; color:#58a6ff; }
+  .tv-suggestion { font-size:0.7rem; color:var(--text3); margin-bottom:4px; }
+  .tv-apply-btn { background:transparent; border:none; color:var(--accent); font-size:0.7rem; cursor:pointer; text-decoration:underline; padding:0; }
+  .tv-articles-details summary { font-size:0.7rem; color:var(--text3); cursor:pointer; padding:2px 0; }
+  .tv-articles-details div { max-height:120px; overflow-y:auto; padding-top:4px; }
+  .tv-art-line { font-size:0.7rem; color:var(--text2); padding:1px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tv-footer { padding:12px 24px; border-top:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+  .tv-progress { font-size:0.75rem; color:var(--text3); }
+  .tv-log-box { background:var(--bg3); border:1px solid var(--border); border-radius:6px; padding:8px 12px; font-size:0.7rem; color:var(--text2); font-family:'DM Mono',monospace; max-height:80px; overflow-y:auto; white-space:pre-wrap; margin-top:8px; display:none; }
 
   /* ═══ WIZARD PREMIER LANCEMENT ═══════════════════════════════════════════ */
   #wizard-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200; display:flex; align-items:center; justify-content:center; }
@@ -1425,7 +1726,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="s-actions">
       <button class="s-btn success" id="s-btn-ingest" onclick="settingsStartIngest()">▶ Start indexing</button>
       <button class="s-btn secondary" onclick="openManageDB()" style="margin-top:8px">🗄️ Manage indexed articles</button>
+      <button class="s-btn secondary" id="s-btn-audit" onclick="auditFixAbstracts()" style="margin-top:8px">🔧 Fix missing abstracts</button>
     </div>
+    <div id="audit-log-box" style="display:none;margin-top:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--text2);max-height:180px;overflow-y:auto;white-space:pre-wrap"></div>
     <hr class="s-sep">
     <h3 style="font-size:1rem;margin-bottom:12px">🤖 Ollama Models</h3>
     <p style="font-size:0.82rem;color:var(--text2);margin-bottom:14px">Install or verify available local models.</p>
@@ -1434,6 +1737,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="s-actions" style="flex-wrap:wrap">
       <button class="s-btn secondary" onclick="settingsRefreshModels()">🔄 Refresh</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ THEME VALIDATION MODAL ══════════════════════════════════════════════ -->
+<div id="theme-validate-modal">
+  <div class="tv-box">
+    <div class="tv-header">
+      <div>
+        <div class="tv-title">🏷️ Organiser ma bibliothèque</div>
+        <div class="tv-stats" id="tv-stats"></div>
+      </div>
+      <button class="tv-close" onclick="closeTVModal()">✕</button>
+    </div>
+    <div class="tv-actions">
+      <button class="tv-btn tv-btn-primary" onclick="tvValidate()">✅ Valider et écrire dans la base</button>
+      <button class="tv-btn tv-btn-secondary" onclick="tvSelectAllWithIssues()">⚠️ Sélectionner les problèmes</button>
+      <button class="tv-btn tv-btn-danger" onclick="tvDeleteSelected()">🗑 Supprimer sélectionnés</button>
+      <span id="tv-sel-count" style="font-size:0.72rem;color:var(--text3);font-family:'DM Mono',monospace;margin-left:4px"></span>
+    </div>
+    <div id="tv-issues-bar" class="tv-issues-bar" style="display:none"></div>
+    <div class="tv-list" id="tv-list"></div>
+    <div class="tv-footer">
+      <div class="tv-progress" id="tv-progress"></div>
+      <div class="tv-log-box" id="tv-log"></div>
     </div>
   </div>
 </div>
@@ -1502,6 +1830,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <div id="active-filter-bar">
+      <span class="af-label">🏷️ Filtre actif : <strong id="active-filter-name"></strong></span>
+      <button class="af-clear" onclick="clearActiveFilter()" title="Désactiver le filtre">✕</button>
+    </div>
     <div id="input-area">
       <div class="input-wrapper">
         <textarea id="query-input" placeholder="Ask a question…" rows="1" disabled></textarea>
@@ -1533,7 +1865,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <span>Themes</span>
           <span id="themes-count" style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--text3)"></span>
         </div>
-        <div id="themes-list" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;max-height:160px;overflow-y:auto;">
+        <div id="themes-list" style="display:flex;flex-direction:column;gap:3px;margin-top:4px;max-height:220px;overflow-y:auto;">
           <div style="color:var(--text3);font-size:0.75rem;font-style:italic">Loading...</div>
         </div>
       </div>
@@ -1555,7 +1887,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <button class="action-btn" onclick="openIngestPanel()">🔄 Index library</button>
-      <button class="action-btn" onclick="openThemePanel()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Thématisation</button>
+      <button class="action-btn" onclick="openThemeWorkflow()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Organiser la bibliothèque</button>
       <button class="action-btn danger" onclick="clearChat()">🗑 Clear conversation</button>
       <button class="action-btn" onclick="settingsOpen()" style="border-color:var(--accent3);color:var(--accent3)">⚙️ Settings</button>
       <button class="action-btn danger" onclick="quitApp()" style="margin-top:8px;border-color:#f85149;color:#f85149;font-weight:600">⏻ Quit RefChat</button>
@@ -1581,6 +1913,7 @@ const memBadge    = document.getElementById('memory-badge');
 
 let isReady = false, isLoading = false, memoryEnabled = false;
 let currentAbortController = null;
+let ingestPoll = null;
 
 // 3 états : false=local seul | true=hybride | "only"=web seul
 let webSearchEnabled = false;
@@ -2086,6 +2419,39 @@ async function settingsStartIngest() {
   openIngestPanel();
 }
 
+// ══ AUDIT: fix missing abstracts ══════════════════════════════════════════════
+
+async function auditFixAbstracts() {
+  const btn = document.getElementById('s-btn-audit');
+  const logBox = document.getElementById('audit-log-box');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+  logBox.style.display = 'block';
+  logBox.textContent = 'Starting audit…\n';
+
+  const r = await fetch('/api/audit/fix-abstracts', { method: 'POST' });
+  const j = await r.json();
+  if (!j.success) {
+    logBox.textContent = '❌ ' + (j.error || 'Error');
+    btn.disabled = false;
+    btn.textContent = '🔧 Fix missing abstracts';
+    return;
+  }
+
+  // Poll status
+  const poll = setInterval(async () => {
+    const s = await (await fetch('/api/audit/status')).json();
+    logBox.textContent = (s.log || []).join('\n');
+    logBox.scrollTop = logBox.scrollHeight;
+    if (s.done) {
+      clearInterval(poll);
+      if (s.error) logBox.textContent += '\n❌ ' + s.error;
+      btn.disabled = false;
+      btn.textContent = '🔧 Fix missing abstracts';
+    }
+  }, 1000);
+}
+
 document.getElementById('settings-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('settings-modal')) settingsClose();
 });
@@ -2128,8 +2494,9 @@ async function sendQuery() {
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
           query: query,
-          web_search: webSearchEnabled
-      }), 
+          web_search: webSearchEnabled,
+          active_theme_filter: activeThemeFilter   // filtre persistant sidebar (null si inactif)
+      }),
       signal:currentAbortController.signal
     });
     
@@ -2151,6 +2518,7 @@ async function sendQuery() {
           messagesEl.scrollTop=messagesEl.scrollHeight;
         }
         if (payload.done) {
+          if (!bubbleReady) { thinkingEl.remove(); messagesEl.appendChild(botDiv); bubbleReady=true; }
           const meta=payload;
           const modeMap={question:'💬 Question',resume:'📋 Summary',reference:'🔎 References',auteur:'👤 Author'};
           let html=`<div class="mode-badge mode-${meta.mode||'question'}">${modeMap[meta.mode]||'💬 Question'}</div>`+marked.parse(fullText);
@@ -2517,7 +2885,83 @@ document.getElementById('check-articles-modal').addEventListener('click', e => {
 });
 
 
-function openThemePanel() {
+// ═══ THÉMATISATION — WORKFLOW 2 ÉTAPES ═══════════════════════════════════════
+
+let activeThemeFilter = null;
+
+function setActiveFilter(theme) {
+  activeThemeFilter = theme;
+  const bar  = document.getElementById('active-filter-bar');
+  const name = document.getElementById('active-filter-name');
+  if (bar)  bar.style.display  = 'flex';
+  if (name) name.textContent   = theme;
+}
+function clearActiveFilter() {
+  activeThemeFilter = null;
+  const bar = document.getElementById('active-filter-bar');
+  if (bar) bar.style.display = 'none';
+}
+
+// ── Sidebar accordéon ──────────────────────────────────────────────────────
+
+async function loadThemes() {
+  const listEl  = document.getElementById('themes-list');
+  const countEl = document.getElementById('themes-count');
+  if (!listEl) return;
+  try {
+    const r = await fetch('/api/themes/articles');
+    const d = await r.json();
+    if (!d.themes || d.themes.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text3);font-size:0.75rem;font-style:italic">Aucun thème — clique sur 🏷️ Organiser la bibliothèque</div>';
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+    if (countEl) countEl.textContent = d.themes.length + ' thème(s)';
+    listEl.innerHTML = d.themes.map((t, i) => {
+      const name  = t.name.length > 32 ? t.name.substring(0, 30) + '…' : t.name;
+      const artHtml = (t.articles || []).slice(0, 20).map(a => {
+        const label = a.auteur ? `${a.auteur} (${a.annee})` : a.fname.replace('.pdf','').substring(0,40);
+        return `<div class="theme-acc-art" title="${a.titre||a.fname}" onclick="setActiveFilter(${JSON.stringify(t.name)})">${label}</div>`;
+      }).join('');
+      const moreHtml = t.count > 20 ? `<div style="font-size:0.65rem;color:var(--text3);padding:2px 4px">+${t.count-20} autres…</div>` : '';
+      return `
+        <div class="theme-accordion-item" id="tacc-${i}">
+          <div class="theme-accordion-header" onclick="toggleThemeAccordion(this)" data-idx="${i}">
+            <span class="theme-acc-name" title="${t.name}">🏷 ${name}</span>
+            <span class="theme-acc-count">${t.count}</span>
+            <span class="theme-acc-chevron">▶</span>
+          </div>
+          <div class="theme-accordion-body" id="taccb-${i}">
+            ${artHtml}${moreHtml}
+            <button class="theme-acc-filter-btn" onclick="setActiveFilter(${JSON.stringify(t.name)})">🔍 Filtrer par ce thème</button>
+          </div>
+        </div>`;
+    }).join('');
+  } catch(e) {
+    if (listEl) listEl.innerHTML = '<div style="color:var(--text3);font-size:0.72rem">Erreur chargement thèmes</div>';
+  }
+}
+
+function toggleThemeAccordion(header) {
+  const idx  = header.dataset.idx;
+  const body = document.getElementById('taccb-' + idx);
+  const chev = header.querySelector('.theme-acc-chevron');
+  if (!body) return;
+  const open = body.style.display === 'block';
+  body.style.display = open ? 'none' : 'block';
+  if (chev) chev.style.transform = open ? '' : 'rotate(90deg)';
+  header.classList.toggle('active', !open);
+}
+
+function setQueryTheme(theme) {
+  queryInput.value = 'Resume les articles du theme ' + theme;
+  queryInput.focus();
+}
+
+// ── Workflow thématisation (preview → validate) ────────────────────────────
+
+function openThemeWorkflow() {
+  // Affiche le panneau de lancement avec choix nb thèmes
   const old = document.getElementById('theme-chat-panel');
   if (old) old.remove();
   const panel = document.createElement('div');
@@ -2526,109 +2970,281 @@ function openThemePanel() {
   panel.innerHTML = `
     <div class="ingest-header">
       <div class="ingest-spinner" id="theme-spinner"></div>
-      <span class="ingest-title">🏷️ Thématisation en cours…</span>
+      <span class="ingest-title">🏷️ Analyse en cours…</span>
     </div>
     <div style="background:rgba(63,185,80,0.08);border:1px solid var(--accent2);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:0.78rem;color:var(--text);line-height:1.5">
-      💡 <strong>What does this do?</strong><br>
-      Analyses existing embeddings to automatically group your articles into themes.
-      Duration: 2–5 min. No PDF re-reading. No Docker needed.<br><br>
-      ⚠️ <strong>Recommended workflow:</strong><br>
-      1. Run a <strong>dry-run first</strong> from the command line to check results:<br>
-      <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">python refchat_theme.py --dry-run --topics 60 --show</code><br>
-      2. Edit <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">refchat_stopwords.txt</code> to remove parasitic label words if needed.<br>
-      3. Only then launch here to write themes to the database.
+      💡 <strong>Comment ça marche ?</strong><br>
+      Analyse les embeddings existants pour grouper automatiquement les articles en thèmes (2–5 min, pas de re-lecture PDF, pas de Docker).<br>
+      Tu pourras <strong>renommer, fusionner et supprimer</strong> les thèmes avant validation.
     </div>
     <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
       <label style="font-size:0.75rem;color:var(--text2);font-family:'DM Mono',monospace;white-space:nowrap">Nb thèmes :</label>
-      <input type="number" id="theme-n-topics" placeholder="auto" min="2" max="50"
+      <input type="number" id="theme-n-topics" placeholder="auto" min="2" max="200"
         style="width:70px;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.8rem">
-      <span style="font-size:0.7rem;color:var(--text3)">Laisse vide = détection automatique</span>
+      <label style="font-size:0.75rem;color:var(--text2);font-family:'DM Mono',monospace;white-space:nowrap">Min articles/thème :</label>
+      <input type="number" id="theme-min-docs" value="5" min="2" max="20"
+        style="width:50px;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.8rem">
     </div>
-    <div class="ingest-log-box" id="theme-chat-log">Démarrage…</div>
+    <button id="theme-launch-btn" onclick="launchThemePreview()" style="background:var(--accent2);color:#0d1117;border:none;padding:8px 20px;border-radius:7px;font-size:0.82rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif;margin-bottom:10px">
+      🔍 Analyser (sans modifier la base)
+    </button>
+    <div class="ingest-log-box" id="theme-chat-log" style="height:160px">En attente…</div>
     <div class="ingest-progress"><div class="ingest-progress-bar" id="theme-chat-bar"></div></div>
     <div id="theme-done-msg" style="display:none;margin-top:10px;font-size:0.82rem;color:var(--accent2)"></div>
   `;
   messagesEl.appendChild(panel);
   messagesEl.scrollTop = messagesEl.scrollHeight;
-
-  const nTopicsInput = document.getElementById('theme-n-topics');
-  const nTopics = nTopicsInput && nTopicsInput.value ? parseInt(nTopicsInput.value) : null;
-
-  fetch('/api/theme/start', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ n_topics: nTopics, min_docs: 2 })
-  }).then(r => r.json()).then(d => {
-    if (!d.success) {
-      const logEl = document.getElementById('theme-chat-log');
-      if (logEl) logEl.textContent = 'Erreur : ' + d.error;
-      const sp = document.getElementById('theme-spinner');
-      if (sp) sp.style.display = 'none';
-      return;
-    }
-    const poll = setInterval(async () => {
-      const s = await (await fetch('/api/theme/status')).json();
-      const logEl  = document.getElementById('theme-chat-log');
-      const barEl  = document.getElementById('theme-chat-bar');
-      const doneEl = document.getElementById('theme-done-msg');
-      const title  = panel.querySelector('.ingest-title');
-      const sp     = document.getElementById('theme-spinner');
-      if (!logEl) { clearInterval(poll); return; }
-      if (s.log && s.log.length) { logEl.textContent = s.log.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
-      if (s.done) {
-        clearInterval(poll);
-        if (sp) sp.style.display = 'none';
-        if (barEl) { barEl.style.animation = 'none'; barEl.style.width = '100%'; }
-        if (s.error) {
-          if (title) title.textContent = '❌ Erreur thématisation';
-          if (barEl) barEl.style.background = '#f85149';
-          showToast('❌ ' + s.error, true);
-        } else {
-          if (title) title.textContent = '✅ Thématisation terminée !';
-          if (barEl) barEl.style.background = 'var(--accent2)';
-          if (doneEl) { doneEl.style.display = 'block'; doneEl.innerHTML = '✅ Themes saved to database — sidebar updated.<br><span style="font-size:0.75rem;color:var(--text3)">💡 If results look off, edit <code>refchat_stopwords.txt</code> and re-run the dry-run before launching again.</span>'; }
-          showToast('✅ Thématisation terminée !');
-          await loadThemes();
-        }
-      }
-    }, 1500);
-  }).catch(e => {
-    const logEl = document.getElementById('theme-chat-log');
-    if (logEl) logEl.textContent = 'Erreur réseau : ' + e.message;
-  });
 }
 
-async function loadThemes() {
-  const listEl = document.getElementById('themes-list');
-  const countEl = document.getElementById('themes-count');
-  if (!listEl) return;
-  try {
-    const r = await fetch('/api/themes');
-    const d = await r.json();
-    if (!d.themes || d.themes.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text3);font-size:0.75rem;font-style:italic">Aucun thème — clique sur 🏷️ Thématisation</div>';
+async function launchThemePreview() {
+  const nTopicsEl  = document.getElementById('theme-n-topics');
+  const minDocsEl  = document.getElementById('theme-min-docs');
+  const logEl      = document.getElementById('theme-chat-log');
+  const barEl      = document.getElementById('theme-chat-bar');
+  const doneEl     = document.getElementById('theme-done-msg');
+  const title      = document.querySelector('#theme-chat-panel .ingest-title');
+  const sp         = document.getElementById('theme-spinner');
+  const launchBtn  = document.getElementById('theme-launch-btn');
+  if (launchBtn) launchBtn.disabled = true;
+  if (logEl) logEl.textContent = 'Lancement de l\'analyse BERTopic…';
+
+  const nTopics = nTopicsEl && nTopicsEl.value ? parseInt(nTopicsEl.value) : null;
+  const minDocs = minDocsEl ? (parseInt(minDocsEl.value) || 5) : 5;
+
+  const r = await fetch('/api/theme/preview', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ n_topics: nTopics, min_docs: minDocs })
+  }).then(r=>r.json()).catch(e => ({ success: false, error: e.message }));
+
+  if (!r.success) {
+    if (logEl) logEl.textContent = '❌ ' + r.error;
+    if (launchBtn) launchBtn.disabled = false;
+    return;
+  }
+
+  let prevPoll = setInterval(async () => {
+    const s = await fetch('/api/theme/preview/status').then(r=>r.json()).catch(()=>({}));
+    if (s.log && s.log.length && logEl) {
+      logEl.textContent = s.log.join('\n');
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (!s.done) return;
+    clearInterval(prevPoll);
+    if (sp) sp.style.display = 'none';
+    if (barEl) { barEl.style.animation='none'; barEl.style.width='100%'; }
+    if (s.error) {
+      if (title) title.textContent = '❌ Erreur analyse';
+      if (barEl) barEl.style.background = '#f85149';
+      if (logEl) logEl.textContent += '\n❌ ' + s.error;
+      if (launchBtn) launchBtn.disabled = false;
       return;
     }
-    countEl.textContent = d.themes.length + ' theme(s)';
-    listEl.innerHTML = d.themes.map(t => {
-      const short = t.length > 30 ? t.substring(0, 28) + '…' : t;
-      return '<button class="example-btn" style="font-size:0.72rem;padding:5px 8px;margin-bottom:3px;" onclick="setQueryTheme(' + JSON.stringify(t) + ')" title="' + t + '">🏷 ' + short + '</button>';
-    }).join('');
-  } catch(e) {
-    listEl.innerHTML = '<div style="color:var(--text3);font-size:0.72rem">Error loading themes</div>';
+    if (title) title.textContent = '✅ Analyse terminée — validation en attente';
+    if (barEl) barEl.style.background = 'var(--accent2)';
+    if (doneEl) {
+      doneEl.style.display = 'block';
+      doneEl.innerHTML = `✅ ${s.result.stats.n_themes} thèmes détectés. ` +
+        (s.result.stats.n_issues ? `⚠️ ${s.result.stats.n_issues} problème(s) qualité. ` : '') +
+        `<button onclick="showTVModal()" style="background:var(--accent2);color:#0d1117;border:none;padding:4px 14px;border-radius:6px;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif;margin-left:8px">🖊 Réviser et valider</button>`;
+    }
+  }, 1500);
+}
+
+// ── Modal de validation ────────────────────────────────────────────────────
+
+let _tvData   = null;   // preview result complet
+let _tvEdits  = {};     // {theme_name: {newName?, deleted?}}
+let _tvValidatePoll = null;
+
+async function showTVModal() {
+  // Récupère le résultat de prévisualisation
+  const s = await fetch('/api/theme/preview/status').then(r=>r.json()).catch(()=>({}));
+  if (!s.result) { showToast('❌ Aucune prévisualisation disponible', true); return; }
+  _tvData  = s.result;
+  _tvEdits = {};
+  _renderTVModal();
+  document.getElementById('theme-validate-modal').style.display = 'flex';
+}
+
+function closeTVModal() {
+  document.getElementById('theme-validate-modal').style.display = 'none';
+  if (_tvValidatePoll) { clearInterval(_tvValidatePoll); _tvValidatePoll = null; }
+}
+
+function _renderTVModal() {
+  const stats   = _tvData.stats;
+  const themes  = _tvData.themes;
+  const issues  = themes.filter(t => t.issues && t.issues.length > 0);
+  document.getElementById('tv-stats').textContent =
+    `${stats.n_articles} articles · ${stats.n_themes} thèmes · ${stats.n_unclassified} non classifiés`;
+  const issuesBar = document.getElementById('tv-issues-bar');
+  if (issues.length) {
+    issuesBar.style.display = 'block';
+    issuesBar.textContent = `⚠️ ${issues.length} thème(s) avec des problèmes qualité détectés (surlignés ci-dessous)`;
+  } else {
+    issuesBar.style.display = 'none';
+  }
+  const list = document.getElementById('tv-list');
+  list.innerHTML = themes.map(t => _renderTVCard(t)).join('');
+  _tvUpdateSelCount();
+}
+
+function _renderTVCard(t) {
+  const edit = _tvEdits[t.name] || {};
+  const deleted   = !!edit.deleted;
+  const issueCls  = t.issues && t.issues.some(i=>i.type==='parasitic') ? 'is-parasitic'
+                  : t.issues && t.issues.length ? 'has-issues' : '';
+  const issueBadges = (t.issues||[]).map(i =>
+    `<span class="tv-issue-badge ${i.type}">${i.msg}</span>`
+  ).join('');
+  const suggLine = t.suggested_rename
+    ? `<div class="tv-suggestion">💡 Suggestion : <em>${t.suggested_rename}</em>
+        <button class="tv-apply-btn" onclick="tvApplySuggestion(${JSON.stringify(t.name)}, ${JSON.stringify(t.suggested_rename)})">Appliquer</button>
+       </div>` : '';
+  const artLines = (t.articles||[]).slice(0,15).map(a => {
+    const lbl = a.auteur ? `${a.auteur} (${a.annee})` : a.fname.replace('.pdf','').substring(0,50);
+    return `<div class="tv-art-line" title="${a.titre||a.fname}">${lbl}</div>`;
+  }).join('');
+  const moreArt = t.count > 15 ? `<div class="tv-art-line" style="color:var(--text3)">+${t.count-15} autres…</div>` : '';
+  const delBtn = deleted
+    ? `<button class="tv-restore-btn" onclick="tvRestoreTheme(${JSON.stringify(t.name)})">↩ Restaurer</button>`
+    : `<button class="tv-del-btn" title="Supprimer ce thème (articles → Non classifié)" onclick="tvDeleteTheme(${JSON.stringify(t.name)})">🗑</button>`;
+  const nameVal = edit.newName !== undefined ? edit.newName : t.name;
+  return `<div class="tv-card ${issueCls} ${deleted ? 'is-deleted' : ''}" id="tvc-${CSS.escape(t.name)}" data-original="${t.name}">
+    <div class="tv-card-top">
+      <input class="tv-name-input" value="${nameVal.replace(/"/g,'&quot;')}" data-original="${t.name}"
+             oninput="_tvSetName(${JSON.stringify(t.name)}, this.value)" ${deleted ? 'disabled' : ''}>
+      <span class="tv-count-badge">${t.count} art.</span>
+      ${delBtn}
+    </div>
+    ${issueBadges ? `<div class="tv-issue-badges">${issueBadges}</div>` : ''}
+    ${suggLine}
+    <details class="tv-articles-details">
+      <summary>${t.count} article(s)</summary>
+      <div>${artLines}${moreArt}</div>
+    </details>
+  </div>`;
+}
+
+function _tvSetName(original, newName) {
+  if (!_tvEdits[original]) _tvEdits[original] = {};
+  _tvEdits[original].newName = newName;
+}
+function tvApplySuggestion(original, suggestion) {
+  if (!_tvEdits[original]) _tvEdits[original] = {};
+  _tvEdits[original].newName = suggestion;
+  const card = document.getElementById('tvc-' + CSS.escape(original));
+  if (card) {
+    const inp = card.querySelector('.tv-name-input');
+    if (inp) inp.value = suggestion;
   }
 }
-
-function setQueryTheme(theme) {
-  queryInput.value = 'Resume les articles du theme ' + theme;
-  queryInput.focus();
+function tvDeleteTheme(name) {
+  if (!_tvEdits[name]) _tvEdits[name] = {};
+  _tvEdits[name].deleted = true;
+  const card = document.getElementById('tvc-' + CSS.escape(name));
+  if (card) {
+    card.classList.add('is-deleted');
+    const inp = card.querySelector('.tv-name-input');
+    if (inp) inp.disabled = true;
+    const delBtn = card.querySelector('.tv-del-btn');
+    if (delBtn) delBtn.outerHTML = `<button class="tv-restore-btn" onclick="tvRestoreTheme(${JSON.stringify(name)})">↩ Restaurer</button>`;
+  }
+  _tvUpdateSelCount();
 }
+function tvRestoreTheme(name) {
+  if (_tvEdits[name]) delete _tvEdits[name].deleted;
+  const card = document.getElementById('tvc-' + CSS.escape(name));
+  if (card) {
+    card.classList.remove('is-deleted');
+    const inp = card.querySelector('.tv-name-input');
+    if (inp) inp.disabled = false;
+    const restBtn = card.querySelector('.tv-restore-btn');
+    if (restBtn) restBtn.outerHTML = `<button class="tv-del-btn" title="Supprimer" onclick="tvDeleteTheme(${JSON.stringify(name)})">🗑</button>`;
+  }
+  _tvUpdateSelCount();
+}
+function tvSelectAllWithIssues() {
+  (_tvData.themes||[]).filter(t=>t.issues&&t.issues.length).forEach(t=>tvDeleteTheme(t.name));
+}
+function tvDeleteSelected() {
+  // Supprime tous les thèmes marqués deleted (déjà marqués par tvDeleteTheme)
+  const deleted = Object.entries(_tvEdits).filter(([,v])=>v.deleted).length;
+  if (!deleted) { showToast('Aucun thème sélectionné pour suppression', true); return; }
+  showToast(`${deleted} thème(s) marqués pour suppression`);
+}
+function _tvUpdateSelCount() {
+  const n = Object.values(_tvEdits).filter(v=>v.deleted).length;
+  const el = document.getElementById('tv-sel-count');
+  if (el) el.textContent = n ? `${n} marqué(s) pour suppression` : '';
+}
+
+function _tvBuildMapping() {
+  const mapping = {};
+  for (const theme of _tvData.themes) {
+    const edit = _tvEdits[theme.name] || {};
+    if (edit.deleted) {
+      for (const art of theme.articles) mapping[art.fname] = 'Non classifie';
+      continue;
+    }
+    const newName = (edit.newName !== undefined && edit.newName.trim())
+                    ? edit.newName.trim() : theme.name;
+    for (const art of theme.articles) mapping[art.fname] = newName;
+  }
+  return mapping;
+}
+
+async function tvValidate() {
+  const mapping = _tvBuildMapping();
+  const n = Object.keys(mapping).length;
+  if (!n) { showToast('Aucun article à mettre à jour', true); return; }
+  const logEl  = document.getElementById('tv-log');
+  const progEl = document.getElementById('tv-progress');
+  if (logEl)  { logEl.style.display='block'; logEl.textContent='Envoi en cours…'; }
+  if (progEl) progEl.textContent = 'Écriture dans ChromaDB…';
+  // Désactiver le bouton valider
+  const btn = document.querySelector('.tv-btn-primary');
+  if (btn) btn.disabled = true;
+
+  const r = await fetch('/api/theme/validate', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ filename_to_theme: mapping })
+  }).then(r=>r.json()).catch(e=>({success:false,error:e.message}));
+
+  if (!r.success) {
+    if (logEl) logEl.textContent = '❌ ' + r.error;
+    if (btn) btn.disabled = false;
+    return;
+  }
+  // Poll validation status
+  _tvValidatePoll = setInterval(async () => {
+    const s = await fetch('/api/theme/validate/status').then(r=>r.json()).catch(()=>({}));
+    if (s.log && s.log.length && logEl) {
+      logEl.textContent = s.log.join('\n'); logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (!s.done) return;
+    clearInterval(_tvValidatePoll); _tvValidatePoll = null;
+    if (s.error) {
+      if (logEl) logEl.textContent += '\n❌ ' + s.error;
+      if (btn) btn.disabled = false;
+      showToast('❌ Erreur validation : ' + s.error, true);
+    } else {
+      if (progEl) progEl.textContent = '✅ Thèmes écrits dans la base !';
+      showToast('✅ Thématisation validée et enregistrée !');
+      await loadThemes();   // rafraîchir sidebar
+      setTimeout(closeTVModal, 1500);
+    }
+  }, 1500);
+}
+
+// Rétro-compat : conserve openThemePanel() au cas où il serait appelé ailleurs
+function openThemePanel() { openThemeWorkflow(); }
 
 // ═══ MANAGE DB ══════════════════════════════════════════════════════════════
 let _mdbArticles = [];
 
 async function openManageDB() {
-  closeSettings();
+  settingsClose();
   const modal = document.getElementById('manage-db-modal');
   modal.style.display = 'flex';
   await loadManageDBArticles();
@@ -2742,8 +3358,10 @@ window.addEventListener('load', async () => {
 
   refreshModelSelect();
   scanNouveauxArticles();
+  loadThemes();  // charge l'accordéon thèmes dès le démarrage
   // Re-scan every 60s to detect new Zotero articles without needing a page reload
   setInterval(scanNouveauxArticles, 60000);
+  setInterval(loadThemes, 120000);  // rafraîchit les thèmes toutes les 2 min
 
   try {
     const r=await fetch('/api/status'); const d=await r.json();
