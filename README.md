@@ -5,7 +5,9 @@ RefChat is a self-hosted, web-based **Retrieval-Augmented Generation (RAG)** app
 **Key features:**
 - 🧠 **Smart indexing** — uses [GROBID](https://github.com/kermitt2/grobid) (via Docker) to split PDFs by section (Abstract, Introduction, Methods, Results, etc.)
 - 🔍 **Three-stage retrieval** — E5 dense embeddings + BM25 keyword search (Reciprocal Rank Fusion) + cross-encoder reranking for maximum precision
-- 📖 **Thesis detection** — automatically classifies long documents as theses/dissertations and limits their context footprint to prevent monopolisation
+- 🏷️ **Automatic thematization** — clusters your library into themes using BERTopic; each theme gets a semantic label and is used to silently filter RAG results
+- 🔎 **OCR pipeline** — detects image-based PDFs (scans), queues them, and re-indexes them with EasyOCR (GPU-accelerated)
+- 📖 **Thesis detection** — automatically classifies long documents as theses/dissertations and limits their context footprint
 - 💬 **Multi-mode chat** — question answering, thematic synthesis, reference lookup, author search
 - 🌐 **Web search integration** — optional [Semantic Scholar](https://api.semanticscholar.org/) API
 - 🤖 **Model flexibility** — Mistral API (cloud) or local models via Ollama (Mistral 7B Q4, Mixtral 8x7B)
@@ -15,9 +17,58 @@ RefChat is a self-hosted, web-based **Retrieval-Augmented Generation (RAG)** app
 
 ---
 
-## What's new in v1.2
+## What's new in v1.4
 
-This version focuses on **retrieval quality** — finding the right articles before asking the LLM to answer.
+### OCR pipeline for image-based PDFs
+
+Many scientific PDFs (older scans, publisher-locked files) contain no extractable text. RefChat now detects these automatically during indexing and provides a one-click OCR pipeline.
+
+**How it works:**
+
+1. **Detection** — during normal indexing, PDFs that fail the `SCAN/EMPTY` or `TOO_SHORT` quality checks are added to an OCR queue (`refchat_ocr_queue.json`) instead of being silently discarded.
+2. **Sidebar badge** — a **🔍 X PDFs image non indexés** badge appears in the sidebar whenever the queue is non-empty.
+3. **OCR & re-index** — clicking "🔎 OCR & indexer" runs the full pipeline:
+   - Each page is rendered at 200 DPI with **PyMuPDF** → numpy array
+   - **EasyOCR** (FR + EN, GPU if available) extracts text
+   - Text goes through the standard fallback chunk pipeline (abstract detection + full text splitting)
+   - Chunks are added to ChromaDB; file is marked as ingested and removed from the queue
+4. **Live log** — progress is streamed in the same panel used for regular indexing
+
+**Installation:** EasyOCR is auto-installed by `RefChat.bat` on first launch (step 3b). GPU support is automatic if CUDA is available.
+
+---
+
+## What's new in v1.3
+
+### Interactive thematization system
+
+RefChat can now automatically organise your library into semantic themes and use those themes to silently improve RAG precision.
+
+**Workflow:**
+
+1. Click **🏷️ Organiser la bibliothèque** in the sidebar
+2. **Dry-run preview** — BERTopic clusters your articles; results are shown in a validation modal with per-theme cards:
+   - Article count and list
+   - Quality warnings (too small, too large, parasitic content, generic label)
+   - Suggested rename if the auto-label is weak
+3. **Edit before committing** — rename themes, delete unwanted ones, apply suggested labels
+4. **Validate** — writes themes to ChromaDB metadata + `refchat_themes.json`
+
+**Theme-aware RAG (3-priority detection):**
+
+| Priority | Mechanism | When used |
+|---|---|---|
+| 1 | Active sidebar filter | User explicitly selected a theme via the accordion |
+| 2 | Semantic cosine similarity | Query embedding compared to theme name embeddings (threshold 0.52) |
+| 3 | Keyword regex | Keyword match on theme names |
+
+When a theme is detected, the ChromaDB search is restricted to that theme's articles — improving precision without changing the prompt.
+
+**Sidebar accordion** — themes are displayed as a collapsible list in the sidebar. Clicking a theme sets a persistent filter badge visible above the input field; clicking again clears it.
+
+---
+
+## What's new in v1.2
 
 ### Retrieval pipeline overhaul
 
@@ -57,10 +108,10 @@ The BM25/dense ratio is now exposed in ⚙️ Settings (`bm25_weight`, default 0
 ## Architecture
 
 ```
-refchat_main.py       ← Launcher: sets up venv, Ollama, models, then starts Flask
 refchat_web.py        ← Flask web app + complete UI (single-file HTML/JS)
 refchat_llm.py        ← RAG logic: retrieval, BM25, cross-encoder, prompts, Semantic Scholar
-refchat_ingest.py     ← PDF ingestion pipeline (GROBID + fallback + ChromaDB)
+refchat_ingest.py     ← PDF ingestion pipeline (GROBID + fallback + ChromaDB + OCR queue)
+refchat_theme.py      ← BERTopic clustering, quality checks, dry-run preview, apply mapping
 refchat_config.py     ← Centralised configuration (reads/writes refchat_config.json)
 Audit_database.py     ← CLI audit tool: fix metadata & inject missing abstracts
 RefChat.bat           ← Windows one-click launcher (auto-installs everything)
@@ -78,6 +129,7 @@ RefChat.bat           ← Windows one-click launcher (auto-installs everything)
 | **RAM** | 8 GB minimum (16 GB+ recommended for local models) |
 | **Disk** | ~6 GB for models + ChromaDB + cross-encoder cache |
 | **Internet** | Required on first run to download models, embeddings, and the cross-encoder |
+| **GPU (optional)** | CUDA-compatible GPU accelerates EasyOCR and embedding inference |
 
 ---
 
@@ -87,7 +139,7 @@ RefChat.bat           ← Windows one-click launcher (auto-installs everything)
 2. **Double-click `RefChat.bat`** — it will:
    - Find Python on your system
    - Create an isolated `.venv`
-   - Install all Python dependencies
+   - Install all Python dependencies (including EasyOCR)
    - Install Ollama (via winget) if not present
    - Download the Mistral 7B Q4 model (~4 GB, one time)
    - Open the app at `http://localhost:5001`
@@ -111,7 +163,7 @@ source .venv/bin/activate
 pip install flask langchain langchain-community langchain-chroma \
     langchain-huggingface langchain-ollama langchain-mistralai \
     langchain-text-splitters chromadb pymupdf sentence-transformers \
-    tqdm requests beautifulsoup4 lxml rank-bm25
+    tqdm requests beautifulsoup4 lxml rank-bm25 easyocr
 
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 
@@ -171,6 +223,10 @@ RefChat automatically detects the intent of your query:
 
 RefChat uses a three-stage pipeline to identify the most relevant articles before generating an answer.
 
+### Stage 0 — Theme filtering (optional)
+
+If a theme has been set (via sidebar selection or semantic/keyword detection), the ChromaDB search is restricted to articles belonging to that theme. This narrows the candidate pool before hybrid search, improving precision on libraries with many articles.
+
 ### Stage 1 — Hybrid search (E5 + BM25)
 
 Two complementary strategies are run in parallel and merged via **Reciprocal Rank Fusion**:
@@ -225,14 +281,18 @@ For each PDF, the pipeline:
 4. **Filters parasite chunks** — short chunks (<150 chars) dominated by DOIs or years (bibliography leftovers) are discarded after splitting.
 5. **Stores in ChromaDB** — with full metadata: `auteur`, `annee`, `titre`, `journal`, `doi`, `doc_type`, `section`, `num_pages`.
 
-### PDF quality filters
-The indexer silently rejects PDFs that are:
-- Scans with no extractable text
-- Too short (under 100 chars/page)
-- Encoded with garbage/binary data
-- Containing incoherent text (under 50% real words — scientific Unicode symbols like δ, α, ‰ are excluded from this ratio)
+### PDF quality filters & OCR queue
+The indexer applies quality checks to every PDF. Files that fail are logged to `refchat_ingest_log.txt`:
 
-Rejected files are logged to `refchat_ingest_log.txt`.
+| Rejection reason | Cause | OCR queued? |
+|---|---|---|
+| `SCAN/EMPTY` | Fewer than 50 extractable characters | ✅ Yes |
+| `TOO_SHORT` | Under 100 chars/page (likely a scan) | ✅ Yes |
+| `PDF_GARBAGE` | Binary/encoding corruption | ❌ No |
+| `CORRUPT_ENCODING` | Under 70% readable characters | ❌ No |
+| `INCOHERENT_TEXT` | Under 50% real words | ❌ No |
+
+Image-based PDFs (`SCAN/EMPTY` and `TOO_SHORT`) are added to `refchat_ocr_queue.json` for later OCR processing. A badge in the sidebar shows when PDFs are waiting.
 
 ### Re-indexing after updates
 A **full re-indexation** is required to benefit from these features on your existing library:
@@ -242,6 +302,33 @@ A **full re-indexation** is required to benefit from these features on your exis
 - Parasite chunk filtering
 
 To force re-indexation of all files, delete `refchat_index_db.json` and re-run the indexer. The BM25 cache (`bm25_index.pkl`) is automatically regenerated afterward.
+
+---
+
+## Thematization
+
+### Running the clustering
+
+Click **🏷️ Organiser la bibliothèque** to open the thematization workflow:
+
+1. **Preview** — BERTopic builds a topic model over your article embeddings. A validation modal shows all detected themes, their articles, quality warnings, and suggested renames.
+2. **Edit** — rename or delete themes before committing.
+3. **Validate** — themes are written to ChromaDB metadata. The sidebar accordion is updated immediately.
+
+### Quality checks
+
+Each theme is analysed for:
+- **Too small** (< 5 articles) — may indicate a noise cluster
+- **Too large** (> 25 articles) — may need splitting
+- **Parasitic content** — topic label contains acknowledgements, bibliography keywords
+- **Generic label** — label contains only very common words (water, rock, hydrogen…)
+
+### Theme filter in chat
+
+The theme filter works at three priority levels:
+1. **Active filter** (sidebar accordion click) — hard filter, only that theme's articles are searched
+2. **Semantic detection** — query embedding compared to theme name embeddings
+3. **Keyword detection** — regex match on theme name tokens
 
 ---
 
@@ -266,21 +353,25 @@ Files modified via the audit tool are registered in `audit_modifications.json` a
 
 ```
 RefChat/
-├── refchat_main.py          # Standalone launcher
-├── refchat_web.py           # Flask app + web UI
-├── refchat_llm.py           # RAG logic, prompts, BM25 + cross-encoder retrieval
-├── refchat_ingest.py        # PDF ingestion pipeline
-├── refchat_config.py        # Config loader/saver
-├── refchat_config.json      # User settings (auto-generated)
-├── refchat_index_db.json    # Ingestion tracking (auto-generated)
-├── refchat_ingest_log.txt   # Ingestion log (auto-generated)
-├── refchat_ignore.txt       # Blacklist of PDFs to skip
-├── audit_modifications.json # Audit registry (auto-generated)
-├── bm25_index.pkl           # BM25 index cache (auto-generated)
-├── Audit_database.py        # CLI audit tool
-├── RefChat.bat              # Windows launcher
-├── refchat_icon.png         # App icon
-└── chroma_db/               # Vector database (auto-generated)
+├── refchat_web.py               # Flask app + web UI
+├── refchat_llm.py               # RAG logic, prompts, BM25 + cross-encoder retrieval
+├── refchat_ingest.py            # PDF ingestion pipeline + OCR queue
+├── refchat_theme.py             # BERTopic clustering + thematization workflow
+├── refchat_config.py            # Config loader/saver
+├── Audit_database.py            # CLI audit tool
+├── RefChat.bat                  # Windows launcher (auto-installs everything)
+├── test_theme_detection.py      # Standalone test: semantic vs keyword theme detection
+│
+├── refchat_config.json          # User settings (auto-generated)
+├── refchat_index_db.json        # Ingestion tracking (auto-generated)
+├── refchat_ingest_log.txt       # Ingestion log — rejects & errors (auto-generated)
+├── refchat_themes.json          # Theme → article mapping (auto-generated after thematization)
+├── refchat_ocr_queue.json       # Image PDFs awaiting OCR (auto-generated)
+├── audit_modifications.json     # Audit registry (auto-generated)
+├── bm25_index.pkl               # BM25 index cache (auto-generated)
+├── refchat_ignore.txt           # Blacklist of PDFs to skip
+├── refchat_icon.png             # App icon
+└── chroma_db/                   # Vector database (auto-generated)
 ```
 
 ---
@@ -291,7 +382,7 @@ All processing happens locally on your machine. No data is sent to external serv
 - Use the **Mistral API** mode (queries are sent to Mistral's cloud)
 - Enable **Semantic Scholar** web search (queries are sent to their public API)
 
-The cross-encoder, BM25 index, and E5 embeddings all run locally — internet is only needed on first launch to download model weights.
+The cross-encoder, BM25 index, E5 embeddings, BERTopic clustering, and EasyOCR all run locally — internet is only needed on first launch to download model weights.
 
 ---
 
