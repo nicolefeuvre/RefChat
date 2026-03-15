@@ -26,8 +26,8 @@ Many scientific PDFs (older scans, publisher-locked files) contain no extractabl
 **How it works:**
 
 1. **Detection** — during normal indexing, PDFs that fail the `SCAN/EMPTY` or `TOO_SHORT` quality checks are added to an OCR queue (`refchat_ocr_queue.json`) instead of being silently discarded.
-2. **Sidebar badge** — a **🔍 X PDFs image non indexés** badge appears in the sidebar whenever the queue is non-empty.
-3. **OCR & re-index** — clicking "🔎 OCR & indexer" runs the full pipeline:
+2. **Sidebar badge** — a **🔍 X unindexed image PDFs** badge appears in the sidebar whenever the queue is non-empty.
+3. **OCR & re-index** — clicking "🔎 OCR & index" runs the full pipeline:
    - Each page is rendered at 200 DPI with **PyMuPDF** → numpy array
    - **EasyOCR** (FR + EN, GPU if available) extracts text
    - Text goes through the standard fallback chunk pipeline (abstract detection + full text splitting)
@@ -46,7 +46,7 @@ RefChat can now automatically organise your library into semantic themes and use
 
 **Workflow:**
 
-1. Click **🏷️ Organiser la bibliothèque** in the sidebar
+1. Click **🏷️ Organise library** in the sidebar
 2. **Dry-run preview** — BERTopic clusters your articles; results are shown in a validation modal with per-theme cards:
    - Article count and list
    - Quality warnings (too small, too large, parasitic content, generic label)
