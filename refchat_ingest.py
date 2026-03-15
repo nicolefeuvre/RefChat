@@ -79,6 +79,7 @@ LOG_FILE       = str(PERSONAL_DATA / "refchat_ingest_log.txt")
 TRACKING_FILE  = str(PERSONAL_DATA / "refchat_index_db.json")
 IGNORE_FILE    = str(_pathlib.Path(__file__).parent / "refchat_ignore.txt")  # user-editable, stays with scripts
 AUDIT_LOG_FILE = str(PERSONAL_DATA / "audit_modifications.json")
+OCR_QUEUE_FILE = str(PERSONAL_DATA / "refchat_ocr_queue.json")
 
 CHUNK_SIZE    = 2000
 CHUNK_OVERLAP = 250
@@ -494,6 +495,197 @@ def _get_abstract(doc_structure, raw_text):
     return "", "none"
 
 
+# ============================================================
+# OCR QUEUE MANAGEMENT
+# ============================================================
+
+def _load_ocr_queue() -> dict:
+    """Returns {filename: pdf_path} dict from OCR queue file."""
+    if not os.path.exists(OCR_QUEUE_FILE):
+        return {}
+    try:
+        with open(OCR_QUEUE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_ocr_queue(queue: dict):
+    os.makedirs(os.path.dirname(OCR_QUEUE_FILE), exist_ok=True)
+    with open(OCR_QUEUE_FILE, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
+
+def _add_to_ocr_queue(filename: str, pdf_path: str):
+    """Add a PDF to the OCR queue."""
+    queue = _load_ocr_queue()
+    queue[filename] = pdf_path
+    _save_ocr_queue(queue)
+
+def _remove_from_ocr_queue(filename: str):
+    """Remove a PDF from the OCR queue after successful OCR ingestion."""
+    queue = _load_ocr_queue()
+    queue.pop(filename, None)
+    _save_ocr_queue(queue)
+
+# ============================================================
+# OCR PIPELINE (EasyOCR + PyMuPDF)
+# ============================================================
+
+_easyocr_reader = None  # Module-level cache — loaded once per process
+
+def _get_easyocr_reader(log_cb=None):
+    """Return cached EasyOCR reader (FR+EN), initialising on first call."""
+    global _easyocr_reader
+    if _easyocr_reader is not None:
+        return _easyocr_reader
+    try:
+        import easyocr
+        import torch
+        gpu = torch.cuda.is_available()
+        if log_cb:
+            log_cb(f"  🔧 Initialising EasyOCR (GPU={'yes' if gpu else 'no'}) …")
+        _easyocr_reader = easyocr.Reader(["fr", "en"], gpu=gpu, verbose=False)
+        return _easyocr_reader
+    except ImportError:
+        raise RuntimeError(
+            "EasyOCR is not installed. Run: pip install easyocr"
+        )
+
+def ocr_pdf_easyocr(pdf_path: str, log_cb=None) -> str:
+    """
+    Render each page of a scanned PDF at 200 DPI with PyMuPDF and run
+    EasyOCR on it.  Returns the concatenated text of all recognised pages.
+    Processes at most MAX_OCR_PAGES pages to stay within reasonable limits.
+    """
+    MAX_OCR_PAGES = 40
+    try:
+        import fitz          # PyMuPDF
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "PyMuPDF is not installed. Run: pip install pymupdf"
+        )
+
+    reader = _get_easyocr_reader(log_cb)
+    doc    = fitz.open(pdf_path)
+    pages  = min(len(doc), MAX_OCR_PAGES)
+    texts  = []
+
+    if log_cb:
+        log_cb(f"  🔍 OCR — {pages} page(s) to process …")
+
+    for i in range(pages):
+        page = doc[i]
+        # Render at 200 DPI (scale factor ≈ 200/72 ≈ 2.78)
+        mat  = fitz.Matrix(200 / 72, 200 / 72)
+        pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+        img  = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+
+        results = reader.readtext(img, detail=0, paragraph=True)
+        page_text = "\n".join(results)
+        texts.append(page_text)
+
+        if log_cb and (i + 1) % 5 == 0:
+            log_cb(f"  📄 OCR progress: {i + 1}/{pages} pages")
+
+    doc.close()
+    full_text = "\n\n".join(t for t in texts if t.strip())
+    if log_cb:
+        log_cb(f"  ✅ OCR complete — {len(full_text)} chars extracted")
+    return full_text
+
+
+def run_ocr_ingest(pdf_path: str, db, log_cb=None) -> dict:
+    """
+    OCR-ingest a single scanned PDF:
+      1. OCR the PDF with EasyOCR
+      2. Build chunks via the fallback path (no GROBID)
+      3. Add chunks to ChromaDB
+      4. Mark file as ingested and remove from OCR queue
+    Returns a result dict: {success, filename, n_chunks, error}
+    """
+    filename = os.path.basename(pdf_path)
+    if log_cb:
+        log_cb(f"📄 OCR ingest: {filename[:80]}")
+
+    # ── OCR ──────────────────────────────────────────────────────────────────
+    try:
+        ocr_text = ocr_pdf_easyocr(pdf_path, log_cb)
+    except Exception as e:
+        if log_cb:
+            log_cb(f"  ❌ OCR failed: {e}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": str(e)}
+
+    if len(ocr_text.strip()) < MIN_CHARS_TOTAL:
+        msg = f"OCR produced too little text ({len(ocr_text.strip())} chars)"
+        if log_cb:
+            log_cb(f"  ⛔ {msg}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": msg}
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    meta     = extract_metadata_from_filename(filename)
+    journal, doi = extract_journal_doi(ocr_text[:2000])
+    doc_type = detect_doc_type(filename, 0, ocr_text)
+
+    metadata_base = {
+        "source":    pdf_path,
+        "filename":  filename,
+        "num_pages": 0,
+        "auteur":    meta["auteur"],
+        "auteurs":   meta["auteurs"],
+        "annee":     meta["annee"],
+        "titre":     meta["titre"],
+        "journal":   journal,
+        "doi":       doi,
+        "doc_type":  doc_type,
+        "ocr":       True,
+    }
+
+    # ── Chunk via fallback path ───────────────────────────────────────────────
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    cleaned_text = _trim_references_at_end(ocr_text)
+
+    abstract, method = _get_abstract(None, cleaned_text)
+    if abstract:
+        if log_cb:
+            log_cb(f"  📋 Abstract via {method} ({len(abstract)} chars)")
+        chunks = chunk_section("Abstract", abstract, metadata_base, splitter)
+        chunks.extend(chunk_section("Full text", cleaned_text, metadata_base, splitter))
+    else:
+        if log_cb:
+            log_cb("  ⚠️  No abstract detected — full text only")
+        chunks = chunk_section("Full text", cleaned_text, metadata_base, splitter)
+
+    if not chunks:
+        msg = "No chunks generated from OCR text"
+        if log_cb:
+            log_cb(f"  ⛔ {msg}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": msg}
+
+    # ── Index into ChromaDB ───────────────────────────────────────────────────
+    try:
+        for i in range(0, len(chunks), BATCH_SIZE):
+            db.add_documents(chunks[i:i + BATCH_SIZE])
+        if log_cb:
+            log_cb(f"  ⚡ {len(chunks)} chunks indexed")
+    except Exception as e:
+        if log_cb:
+            log_cb(f"  ❌ ChromaDB error: {e}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": str(e)}
+
+    # ── Tracking ─────────────────────────────────────────────────────────────
+    already_ingested = load_already_ingested()
+    mark_as_ingested(already_ingested, pdf_path, len(chunks))
+    save_already_ingested(already_ingested)
+    _remove_from_ocr_queue(filename)
+
+    if log_cb:
+        log_cb(f"  ✅ Done — {filename[:60]}")
+
+    return {"success": True, "filename": filename, "n_chunks": len(chunks), "error": None}
+
+
 def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
     doc_structure, status = extract_sections_grobid(pdf_path)
     chunks = []
@@ -725,6 +917,10 @@ def main():
                 _log(f"  ⛔ REJECTED — {reason}  ({duration:.1f}s)")
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     f.write(f"REJECTED ({reason}): {pdf_path}\n")
+                # Image-based PDFs (SCAN/EMPTY or TOO_SHORT) → add to OCR queue
+                if key in ("SCAN/EMPTY", "TOO_SHORT"):
+                    _add_to_ocr_queue(file, pdf_path)
+                    _log(f"  🔎 Added to OCR queue for later processing")
                 mark_as_ingested(already_ingested, pdf_path, 0)
                 continue
 

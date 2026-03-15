@@ -70,6 +70,12 @@ STATE = {
     "audit_log":     [],
     "audit_done":    False,
     "audit_error":   None,
+    # OCR
+    "ocr_running": False,
+    "ocr_log":     [],
+    "ocr_done":    False,
+    "ocr_error":   None,
+    "ocr_stats":   None,   # {"total": N, "success": N, "failed": N, "skipped": N}
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -887,6 +893,71 @@ def api_audit_status():
         "done":    STATE["audit_done"],
         "error":   STATE["audit_error"],
         "log":     STATE["audit_log"][-150:],
+    })
+
+@app.route("/api/ocr/queue")
+def api_ocr_queue():
+    """Returns the current OCR queue (image PDFs awaiting OCR)."""
+    from refchat_ingest import _load_ocr_queue
+    queue = _load_ocr_queue()
+    return jsonify({"count": len(queue), "items": list(queue.keys())})
+
+@app.route("/api/ocr/start", methods=["POST"])
+def api_ocr_start():
+    if STATE["ocr_running"]:
+        return jsonify({"success": False, "error": "OCR already in progress"})
+    if not STATE["db"]:
+        return jsonify({"success": False, "error": "Database not loaded — start the app first"})
+
+    from refchat_ingest import _load_ocr_queue, run_ocr_ingest
+    queue = _load_ocr_queue()
+    if not queue:
+        return jsonify({"success": False, "error": "No PDFs in the OCR queue"})
+
+    STATE.update({"ocr_running": True, "ocr_log": [],
+                  "ocr_done": False, "ocr_error": None, "ocr_stats": None})
+
+    def run():
+        stats = {"total": len(queue), "success": 0, "failed": 0, "skipped": 0}
+        try:
+            def log_cb(msg):
+                STATE["ocr_log"].append(msg.rstrip())
+
+            log_cb(f"🔎 Starting OCR for {stats['total']} PDF(s)…")
+
+            for filename, pdf_path in list(queue.items()):
+                if not pathlib.Path(pdf_path).exists():
+                    log_cb(f"⚠️  File not found, skipping: {filename[:60]}")
+                    stats["skipped"] += 1
+                    continue
+                result = run_ocr_ingest(pdf_path, STATE["db"], log_cb=log_cb)
+                if result["success"]:
+                    stats["success"] += 1
+                else:
+                    stats["failed"] += 1
+                log_cb("")
+
+            STATE["ocr_stats"] = stats
+            log_cb(f"✅ OCR complete — {stats['success']}/{stats['total']} indexed, "
+                   f"{stats['failed']} failed, {stats['skipped']} skipped")
+            STATE["ocr_done"] = True
+        except Exception as e:
+            STATE["ocr_error"] = str(e)
+            STATE["ocr_done"]  = True
+        finally:
+            STATE["ocr_running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+@app.route("/api/ocr/status")
+def api_ocr_status():
+    return jsonify({
+        "running": STATE["ocr_running"],
+        "done":    STATE["ocr_done"],
+        "error":   STATE["ocr_error"],
+        "stats":   STATE["ocr_stats"],
+        "log":     STATE["ocr_log"][-150:],
     })
 
 @app.route("/api/init", methods=["POST"])
@@ -1886,6 +1957,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button onclick="openCheckArticlesModal()" title="Choose which articles to blacklist before indexing" style="background:var(--bg3);color:var(--text2);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font-size:0.78rem;cursor:pointer;font-family:'Figtree',sans-serif;white-space:nowrap" onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text2)'">☑ Check</button>
         </div>
       </div>
+      <div id="ocr-badge" style="display:none;background:#1a2510;border:1px solid #3fb950;border-radius:8px;padding:10px 12px;margin-bottom:6px;">
+        <div style="font-size:0.75rem;color:#3fb950;font-weight:600;margin-bottom:6px" id="ocr-badge-label">🔍 0 PDFs image non indexés</div>
+        <div id="ocr-badge-preview" style="font-size:0.68rem;color:var(--text3);font-family:'DM Mono',monospace;margin-bottom:8px;line-height:1.5"></div>
+        <button onclick="openOCRPanel()" style="width:100%;background:#238636;color:#fff;border:none;padding:6px 10px;border-radius:6px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif">🔎 OCR & indexer</button>
+      </div>
       <button class="action-btn" onclick="openIngestPanel()">🔄 Index library</button>
       <button class="action-btn" onclick="openThemeWorkflow()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Organiser la bibliothèque</button>
       <button class="action-btn danger" onclick="clearChat()">🗑 Clear conversation</button>
@@ -2775,6 +2851,96 @@ async function scanNouveauxArticles() {
   }
 }
 
+// ══ OCR QUEUE & PANEL ══════════════════════════════════════════════════════════
+
+async function loadOCRQueue() {
+  try {
+    const r = await fetch('/api/ocr/queue');
+    const d = await r.json();
+    const badge   = document.getElementById('ocr-badge');
+    const label   = document.getElementById('ocr-badge-label');
+    const preview = document.getElementById('ocr-badge-preview');
+    if (d.count > 0) {
+      badge.style.display = 'block';
+      label.textContent = `🔍 ${d.count} PDF${d.count > 1 ? 's' : ''} image non indexé${d.count > 1 ? 's' : ''}`;
+      const names = (d.items || []).slice(0, 5).map(n => '• ' + n.replace(/\.[^.]+$/, '').substring(0, 40)).join('\n');
+      preview.textContent = names + (d.count > 5 ? `\n… +${d.count - 5} autres` : '');
+    } else {
+      badge.style.display = 'none';
+    }
+  } catch {}
+}
+
+let ocrPoll = null;
+
+function openOCRPanel() {
+  openPanelWithStreaming({
+    title: '🔍 OCR — PDFs image',
+    startUrl: '/api/ocr/start',
+    statusUrl: '/api/ocr/status',
+    startPayload: {},
+    onDone: async (data) => {
+      await loadOCRQueue();
+      if (data.stats) {
+        const s = data.stats;
+        return `✅ OCR terminé — ${s.success}/${s.total} indexé(s), ${s.failed} échec(s), ${s.skipped} ignoré(s)`;
+      }
+      return '✅ OCR terminé';
+    },
+  });
+}
+
+/**
+ * Generic helper: opens the ingest-style log panel, starts a background job
+ * and polls until done.
+ * opts: { title, startUrl, statusUrl, startPayload, onDone }
+ */
+function openPanelWithStreaming(opts) {
+  const panel   = document.getElementById('ingest-panel');
+  const titleEl = document.getElementById('ingest-panel-title');
+  const logEl   = document.getElementById('ingest-log');
+  const doneEl  = document.getElementById('ingest-done-msg');
+  if (!panel) return;
+
+  if (titleEl) titleEl.textContent = opts.title || '⏳ Processing…';
+  if (doneEl)  doneEl.style.display = 'none';
+  logEl.innerHTML = '';
+  panel.style.display = 'flex';
+
+  fetch(opts.startUrl, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(opts.startPayload || {}),
+  }).then(r => r.json()).then(async d => {
+    if (!d.success) {
+      logEl.innerHTML += `<div style="color:#f85149">❌ ${d.error || 'Erreur'}</div>`;
+      return;
+    }
+    let seen = 0;
+    if (ocrPoll) clearInterval(ocrPoll);
+    ocrPoll = setInterval(async () => {
+      try {
+        const s = await (await fetch(opts.statusUrl)).json();
+        const lines = s.log || [];
+        for (let i = seen; i < lines.length; i++) {
+          const div = document.createElement('div');
+          div.textContent = lines[i];
+          logEl.appendChild(div);
+        }
+        seen = lines.length;
+        logEl.scrollTop = logEl.scrollHeight;
+        if (!s.running) {
+          clearInterval(ocrPoll); ocrPoll = null;
+          let msg = s.error ? `❌ ${s.error}` : (opts.onDone ? await opts.onDone(s) : '✅ Done');
+          if (doneEl) { doneEl.textContent = msg; doneEl.style.display = 'block'; }
+        }
+      } catch {}
+    }, 800);
+  }).catch(e => {
+    logEl.innerHTML += `<div style="color:#f85149">❌ ${e.message}</div>`;
+  });
+}
+
 // ══ CHECK ARTICLES MODAL ══════════════════════════════════════════════════════
 
 let checkArticlesData = [];
@@ -3358,10 +3524,12 @@ window.addEventListener('load', async () => {
 
   refreshModelSelect();
   scanNouveauxArticles();
-  loadThemes();  // charge l'accordéon thèmes dès le démarrage
+  loadThemes();      // charge l'accordéon thèmes dès le démarrage
+  loadOCRQueue();    // badge PDFs image non indexés
   // Re-scan every 60s to detect new Zotero articles without needing a page reload
   setInterval(scanNouveauxArticles, 60000);
-  setInterval(loadThemes, 120000);  // rafraîchit les thèmes toutes les 2 min
+  setInterval(loadThemes, 120000);    // rafraîchit les thèmes toutes les 2 min
+  setInterval(loadOCRQueue, 120000);  // rafraîchit la queue OCR toutes les 2 min
 
   try {
     const r=await fetch('/api/status'); const d=await r.json();

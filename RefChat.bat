@@ -151,6 +151,23 @@ echo    OK
 :deps_done
 
 :: -----------------------------------------------------------------
+:: STEP 3b : EasyOCR (optional — installed separately to avoid breaking
+::            existing setups; skipped silently if already present)
+:: -----------------------------------------------------------------
+"%VENV_PYTHON%" -c "import easyocr" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [3b/5] Installing EasyOCR for image-PDF support...
+    "%VENV_PYTHON%" -m pip install easyocr --quiet --no-warn-script-location
+    if %ERRORLEVEL% NEQ 0 (
+        echo    WARNING: EasyOCR installation failed. OCR features will be unavailable.
+        echo    You can retry manually: pip install easyocr
+    ) else (
+        echo    OK - EasyOCR installed.
+    )
+)
+
+:: -----------------------------------------------------------------
 :: STEP 4 : Ollama
 :: -----------------------------------------------------------------
 echo.
