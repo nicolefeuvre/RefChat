@@ -69,16 +69,17 @@ from bs4 import BeautifulSoup
 # ============================================================
 # CENTRAL CONFIG
 # ============================================================
-from refchat_config import EMBEDDING_MODEL, DB_PATH, get as config_get
+from refchat_config import EMBEDDING_MODEL, DB_PATH, PERSONAL_DATA, get as config_get
 import pathlib as _pathlib
 
 ZOTERO_PATH  = config_get("zotero_path", "")
 _BASE_DIR    = _pathlib.Path(__file__).parent.resolve()
 
-LOG_FILE       = str(_pathlib.Path(__file__).parent / "refchat_ingest_log.txt")
-TRACKING_FILE  = str(_pathlib.Path(__file__).parent / "refchat_index_db.json")
-IGNORE_FILE    = str(_pathlib.Path(__file__).parent / "refchat_ignore.txt")
-AUDIT_LOG_FILE = str(_pathlib.Path(__file__).parent / "audit_modifications.json")
+LOG_FILE       = str(PERSONAL_DATA / "refchat_ingest_log.txt")
+TRACKING_FILE  = str(PERSONAL_DATA / "refchat_index_db.json")
+IGNORE_FILE    = str(_pathlib.Path(__file__).parent / "refchat_ignore.txt")  # user-editable, stays with scripts
+AUDIT_LOG_FILE = str(PERSONAL_DATA / "audit_modifications.json")
+OCR_QUEUE_FILE = str(PERSONAL_DATA / "refchat_ocr_queue.json")
 
 CHUNK_SIZE    = 2000
 CHUNK_OVERLAP = 250
@@ -205,6 +206,35 @@ _JOURNAL_PATTERNS = [
     re.compile(r'(Applied\s+Geochemistry)', re.IGNORECASE),
 ]
 
+_THESIS_FILENAME_RE = re.compile(
+    r'\b(th[eè]se|thesis|dissertation|m[eé]moire|phd|doctorat)\b',
+    re.IGNORECASE
+)
+
+_THESIS_TEXT_RE = re.compile(
+    r'\b(jury|remerciements?|acknowledgements?|th[eè]se|dissertation|'
+    r'doctorat|directeur\s+de\s+th[eè]se|thesis\s+supervisor|'
+    r'école\s+doctorale|graduate\s+school|universit[eé])\b',
+    re.IGNORECASE
+)
+
+def detect_doc_type(filename, num_pages, text_sample):
+    """Classify a document as 'thesis' or 'article' using 3 combined signals:
+    - filename contains thesis-related keywords (strong: weight 2)
+    - number of pages > 80 (weight 1)
+    - text sample contains >= 3 thesis-related keywords (weight 1)
+    Returns 'thesis' if total weight >= 2, else 'article'.
+    """
+    signals = 0
+    if _THESIS_FILENAME_RE.search(os.path.splitext(filename)[0]):
+        signals += 2
+    if num_pages > 80:
+        signals += 1
+    if len(_THESIS_TEXT_RE.findall(text_sample[:5000])) >= 3:
+        signals += 1
+    return "thesis" if signals >= 2 else "article"
+
+
 def extract_journal_doi(first_page_text):
     zone = first_page_text[:3000]
     doi = ""
@@ -226,10 +256,17 @@ def ratio_readable_chars(text):
     n = sum(1 for c in text if unicodedata.category(c).startswith(('L', 'N', 'P', 'Z')) or c in (' ', '\n', '\t'))
     return n / len(text)
 
+_SCIENTIFIC_SYMBOL_RE = re.compile(
+    r'^[\u03b1-\u03c9\u0391-\u03a9\u0394\u03b4\u2030\u2080-\u2089'
+    r'\u00b0\u00b1\u2192\u2260\u2248\u00b5\u2030\u2081-\u2089\u00b2\u00b3]+$'
+)
+
 def ratio_real_words(text):
     words = text.split()
     if not words: return 0.0
-    return len([w for w in words if 2 <= len(w) <= 25]) / len(words)
+    def _is_real(w):
+        return 2 <= len(w) <= 25 or bool(_SCIENTIFIC_SYMBOL_RE.match(w))
+    return len([w for w in words if _is_real(w)]) / len(words)
 
 def contains_pdf_garbage(text):
     patterns = [r'obj<<', r'endobj', r'stream\s', r'BT\s+/F', r'â€|Ã©|Ã |ï¬', r'ÿþ', r'\x00']
@@ -363,11 +400,295 @@ def extract_sections_grobid(pdf_path):
 # CHUNKING AND INDEXING
 # ============================================================
 
+_PARASITE_RE = re.compile(r'10\.\d{4,9}/\S+|\b(?:19|20)\d{2}\b')
+
+def _is_parasite_chunk(text, min_chars=150, max_ratio=0.5):
+    """True if the chunk is short AND dominated by DOIs/years (bibliography leftovers)."""
+    if len(text) >= min_chars:
+        return False
+    words = text.split()
+    if not words:
+        return True
+    return len(_PARASITE_RE.findall(text)) / len(words) > max_ratio
+
 def chunk_section(section_name, section_text, metadata_base, splitter):
     if len(section_text.strip()) < 100:
         return []
-    text = f"passage: {section_text}" if "e5" in EMBEDDING_MODEL.lower() else section_text
-    return splitter.create_documents([text], metadatas=[{**metadata_base, "section": section_name}])
+    auteur = metadata_base.get("auteur", "")
+    annee  = metadata_base.get("annee", "")
+    prefix = f"[{auteur} {annee}] " if auteur or annee else ""
+    if "e5" in EMBEDDING_MODEL.lower():
+        text = f"passage: {prefix}{section_text}"
+    else:
+        text = f"{prefix}{section_text}"
+    docs = splitter.create_documents([text], metadatas=[{**metadata_base, "section": section_name}])
+    return [d for d in docs if not _is_parasite_chunk(d.page_content)]
+
+# Regex to detect abstract header + body in raw PDF text (used when GROBID fails)
+_ABSTRACT_HEADER_RE = re.compile(
+    r'(?:^|\n)\s*(?:ABSTRACT|Abstract|RÉSUMÉ|Résumé|résumé|RESUME|Summary|SUMMARY)\s*[:\-—]?\s*\n+'
+    r'([\s\S]{100,2500}?)'
+    r'(?=\n\s*(?:\d[\.\s]|Introduction|INTRODUCTION|Keywords|KEYWORDS|'
+    r'Mots[- ]clés|Index[- ]terms|Background|BACKGROUND|\n\n\n))',
+    re.MULTILINE
+)
+# Simpler fallback: "Abstract" on same line as text (no newline between header and body)
+_ABSTRACT_INLINE_RE = re.compile(
+    r'(?:^|\n)\s*(?:ABSTRACT|Abstract|RÉSUMÉ|Résumé|Summary)[:\s\-—]+([A-Z][^#\n]{100,2500}?)(?=\n\s*\n)',
+    re.MULTILINE
+)
+
+def _extract_abstract_from_raw(text):
+    """Regex fallback: tries to find the abstract in raw PDF text. Returns '' if not found."""
+    sample = text[:6000]
+    for pattern in (_ABSTRACT_HEADER_RE, _ABSTRACT_INLINE_RE):
+        m = pattern.search(sample)
+        if m:
+            abstract = m.group(1).strip()
+            if len(abstract) >= 100:
+                return abstract
+    return ""
+
+
+def _first_page_proxy(text, min_chars=200, target_chars=1200):
+    """Last-resort proxy: take the first meaningful content lines as a proxy abstract.
+    Skips short header lines (title, authors, journal, DOI) and returns the first
+    substantial paragraph-like content. Works even on poor OCR / scanned PDFs."""
+    lines = text.split('\n')
+    content_lines = []
+    total = 0
+    for line in lines:
+        stripped = line.strip()
+        # Skip short lines (headers, page numbers, DOI lines, etc.)
+        if len(stripped) < 40:
+            continue
+        # Stop at obvious section headers
+        if re.match(r'^(?:\d[\.\s]|Introduction|INTRODUCTION|Methods|METHODS|Keywords)', stripped):
+            break
+        content_lines.append(stripped)
+        total += len(stripped)
+        if total >= target_chars:
+            break
+    result = ' '.join(content_lines)
+    return result[:target_chars] if len(result) >= min_chars else ""
+
+
+def _get_abstract(doc_structure, raw_text):
+    """3-level abstract extraction: GROBID → regex → first-page proxy.
+    Returns (abstract_text, method_label)."""
+    # Level 1: GROBID
+    if doc_structure:
+        abstract = doc_structure.get("Abstract", "")
+        if abstract and len(abstract) >= 100:
+            return abstract, "GROBID"
+
+    # Level 2: regex on raw text
+    abstract = _extract_abstract_from_raw(raw_text)
+    if abstract:
+        return abstract, "regex"
+
+    # Level 3: first-page proxy (always works if text is readable)
+    abstract = _first_page_proxy(raw_text)
+    if abstract:
+        return abstract, "proxy"
+
+    return "", "none"
+
+
+# ============================================================
+# OCR QUEUE MANAGEMENT
+# ============================================================
+
+def _load_ocr_queue() -> dict:
+    """Returns {filename: pdf_path} dict from OCR queue file."""
+    if not os.path.exists(OCR_QUEUE_FILE):
+        return {}
+    try:
+        with open(OCR_QUEUE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_ocr_queue(queue: dict):
+    os.makedirs(os.path.dirname(OCR_QUEUE_FILE), exist_ok=True)
+    with open(OCR_QUEUE_FILE, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
+
+def _add_to_ocr_queue(filename: str, pdf_path: str):
+    """Add a PDF to the OCR queue."""
+    queue = _load_ocr_queue()
+    queue[filename] = pdf_path
+    _save_ocr_queue(queue)
+
+def _remove_from_ocr_queue(filename: str):
+    """Remove a PDF from the OCR queue after successful OCR ingestion."""
+    queue = _load_ocr_queue()
+    queue.pop(filename, None)
+    _save_ocr_queue(queue)
+
+# ============================================================
+# OCR PIPELINE (EasyOCR + PyMuPDF)
+# ============================================================
+
+_easyocr_reader = None  # Module-level cache — loaded once per process
+
+def _get_easyocr_reader(log_cb=None):
+    """Return cached EasyOCR reader (FR+EN), initialising on first call."""
+    global _easyocr_reader
+    if _easyocr_reader is not None:
+        return _easyocr_reader
+    try:
+        import easyocr
+        import torch
+        gpu = torch.cuda.is_available()
+        if log_cb:
+            log_cb(f"  🔧 Initialising EasyOCR (GPU={'yes' if gpu else 'no'}) …")
+        _easyocr_reader = easyocr.Reader(["fr", "en"], gpu=gpu, verbose=False)
+        return _easyocr_reader
+    except ImportError:
+        raise RuntimeError(
+            "EasyOCR is not installed. Run: pip install easyocr"
+        )
+
+def ocr_pdf_easyocr(pdf_path: str, log_cb=None) -> str:
+    """
+    Render each page of a scanned PDF at 200 DPI with PyMuPDF and run
+    EasyOCR on it.  Returns the concatenated text of all recognised pages.
+    Processes at most MAX_OCR_PAGES pages to stay within reasonable limits.
+    """
+    MAX_OCR_PAGES = 40
+    try:
+        import fitz          # PyMuPDF
+        import numpy as np
+    except ImportError:
+        raise RuntimeError(
+            "PyMuPDF is not installed. Run: pip install pymupdf"
+        )
+
+    reader = _get_easyocr_reader(log_cb)
+    doc    = fitz.open(pdf_path)
+    pages  = min(len(doc), MAX_OCR_PAGES)
+    texts  = []
+
+    if log_cb:
+        log_cb(f"  🔍 OCR — {pages} page(s) to process …")
+
+    for i in range(pages):
+        page = doc[i]
+        # Render at 200 DPI (scale factor ≈ 200/72 ≈ 2.78)
+        mat  = fitz.Matrix(200 / 72, 200 / 72)
+        pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
+        img  = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+
+        results = reader.readtext(img, detail=0, paragraph=True)
+        page_text = "\n".join(results)
+        texts.append(page_text)
+
+        if log_cb and (i + 1) % 5 == 0:
+            log_cb(f"  📄 OCR progress: {i + 1}/{pages} pages")
+
+    doc.close()
+    full_text = "\n\n".join(t for t in texts if t.strip())
+    if log_cb:
+        log_cb(f"  ✅ OCR complete — {len(full_text)} chars extracted")
+    return full_text
+
+
+def run_ocr_ingest(pdf_path: str, db, log_cb=None) -> dict:
+    """
+    OCR-ingest a single scanned PDF:
+      1. OCR the PDF with EasyOCR
+      2. Build chunks via the fallback path (no GROBID)
+      3. Add chunks to ChromaDB
+      4. Mark file as ingested and remove from OCR queue
+    Returns a result dict: {success, filename, n_chunks, error}
+    """
+    filename = os.path.basename(pdf_path)
+    if log_cb:
+        log_cb(f"📄 OCR ingest: {filename[:80]}")
+
+    # ── OCR ──────────────────────────────────────────────────────────────────
+    try:
+        ocr_text = ocr_pdf_easyocr(pdf_path, log_cb)
+    except Exception as e:
+        if log_cb:
+            log_cb(f"  ❌ OCR failed: {e}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": str(e)}
+
+    if len(ocr_text.strip()) < MIN_CHARS_TOTAL:
+        msg = f"OCR produced too little text ({len(ocr_text.strip())} chars)"
+        if log_cb:
+            log_cb(f"  ⛔ {msg}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": msg}
+
+    # ── Metadata ─────────────────────────────────────────────────────────────
+    meta     = extract_metadata_from_filename(filename)
+    journal, doi = extract_journal_doi(ocr_text[:2000])
+    doc_type = detect_doc_type(filename, 0, ocr_text)
+
+    metadata_base = {
+        "source":    pdf_path,
+        "filename":  filename,
+        "num_pages": 0,
+        "auteur":    meta["auteur"],
+        "auteurs":   meta["auteurs"],
+        "annee":     meta["annee"],
+        "titre":     meta["titre"],
+        "journal":   journal,
+        "doi":       doi,
+        "doc_type":  doc_type,
+        "ocr":       True,
+    }
+
+    # ── Chunk via fallback path ───────────────────────────────────────────────
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    cleaned_text = _trim_references_at_end(ocr_text)
+
+    abstract, method = _get_abstract(None, cleaned_text)
+    if abstract:
+        if log_cb:
+            log_cb(f"  📋 Abstract via {method} ({len(abstract)} chars)")
+        chunks = chunk_section("Abstract", abstract, metadata_base, splitter)
+        chunks.extend(chunk_section("Full text", cleaned_text, metadata_base, splitter))
+    else:
+        if log_cb:
+            log_cb("  ⚠️  No abstract detected — full text only")
+        chunks = chunk_section("Full text", cleaned_text, metadata_base, splitter)
+
+    if not chunks:
+        msg = "No chunks generated from OCR text"
+        if log_cb:
+            log_cb(f"  ⛔ {msg}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": msg}
+
+    # ── v1.5: tag each chunk with its sequence number (windowed retrieval) ──
+    for _seq, _doc in enumerate(chunks):
+        _doc.metadata["chunk_seq"] = _seq
+
+    # ── Index into ChromaDB ───────────────────────────────────────────────────
+    try:
+        for i in range(0, len(chunks), BATCH_SIZE):
+            db.add_documents(chunks[i:i + BATCH_SIZE])
+        if log_cb:
+            log_cb(f"  ⚡ {len(chunks)} chunks indexed")
+    except Exception as e:
+        if log_cb:
+            log_cb(f"  ❌ ChromaDB error: {e}")
+        return {"success": False, "filename": filename, "n_chunks": 0, "error": str(e)}
+
+    # ── Tracking ─────────────────────────────────────────────────────────────
+    already_ingested = load_already_ingested()
+    mark_as_ingested(already_ingested, pdf_path, len(chunks))
+    save_already_ingested(already_ingested)
+    _remove_from_ocr_queue(filename)
+
+    if log_cb:
+        log_cb(f"  ✅ Done — {filename[:60]}")
+
+    return {"success": True, "filename": filename, "n_chunks": len(chunks), "error": None}
+
 
 def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
     doc_structure, status = extract_sections_grobid(pdf_path)
@@ -376,10 +697,11 @@ def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
     if doc_structure:
         found_sections = []
 
-        abstract = doc_structure.get("Abstract", "")
+        # Get abstract via 3-level cascade
+        abstract, method = _get_abstract(doc_structure, raw_text_fallback)
         if abstract:
             chunks.extend(chunk_section("Abstract", abstract, metadata_base, splitter))
-            found_sections.append("Abstract")
+            found_sections.append(f"Abstract[{method}]")
 
         for sec in doc_structure.get("Sections", []):
             title = sec["titre"]
@@ -401,6 +723,15 @@ def create_article_chunks(pdf_path, raw_text_fallback, metadata_base, splitter):
 
     _log(f"      🟡 [FALLBACK] GROBID failed/empty ({status}). Using raw text.")
     cleaned_text = _trim_references_at_end(raw_text_fallback)
+
+    abstract, method = _get_abstract(None, cleaned_text)
+    if abstract:
+        _log(f"      📋 [FALLBACK] Abstract via {method} ({len(abstract)} chars)")
+        chunks = chunk_section("Abstract", abstract, metadata_base, splitter)
+        chunks.extend(chunk_section("Full text", cleaned_text, metadata_base, splitter))
+        return chunks, True, status
+
+    _log(f"      ⚠️ [FALLBACK] No abstract found — Full text only")
     return chunk_section("Full text", cleaned_text, metadata_base, splitter), True, status
 
 # ============================================================
@@ -439,13 +770,30 @@ def mark_as_ingested(already_ingested, pdf_path, nb_chunks):
         "filename": os.path.basename(pdf_path)
     }
 
+def _detect_device_and_batch():
+    """Auto-detect best compute device + safe batch size.
+    Priority: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
+    CUDA batch size scaled to VRAM to avoid OOM on small GPUs.
+    """
+    if torch.cuda.is_available():
+        try:
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            if   vram_gb >= 8: batch = 512
+            elif vram_gb >= 6: batch = 256
+            elif vram_gb >= 4: batch = 128
+            else:              batch = 64
+        except Exception:
+            batch = 128
+        return "cuda", batch
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps", 128   # Apple Silicon
+    return "cpu", 32        # CPU: small batch = less RAM pressure during ingest
+
+
 def load_embedding():
     _log(f"⏳ Loading {EMBEDDING_MODEL} ...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _log(f"   ⚙️ Vector computation configured on: {device.upper()}")
-
-    is_e5 = "e5" in EMBEDDING_MODEL.lower()
-    batch_size = 32 if device == "cpu" else 256
+    device, batch_size = _detect_device_and_batch()
+    _log(f"   ⚙️  Device: {device.upper()} — batch_size={batch_size}")
 
     embedding_function = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
@@ -454,9 +802,9 @@ def load_embedding():
         multi_process=False,
     )
 
-    if is_e5:
+    if "e5" in EMBEDDING_MODEL.lower():
         _log("   ℹ️  E5 model detected — 'passage: ' prefix added to chunks")
-    _log(f"   ✅ Model loaded (batch_size={batch_size}).")
+    _log(f"   ✅ Model loaded.")
     return embedding_function
 
 def _scan_zotero_pdfs(zotero_path):
@@ -539,7 +887,7 @@ def main():
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " "]
+        separators=["\n\n", ". ", "\n", " "]
     )
 
     valid_pdfs    = 0
@@ -573,16 +921,23 @@ def main():
                 _log(f"  ⛔ REJECTED — {reason}  ({duration:.1f}s)")
                 with open(LOG_FILE, "a", encoding="utf-8") as f:
                     f.write(f"REJECTED ({reason}): {pdf_path}\n")
+                # Image-based PDFs (SCAN/EMPTY or TOO_SHORT) → add to OCR queue
+                if key in ("SCAN/EMPTY", "TOO_SHORT"):
+                    _add_to_ocr_queue(file, pdf_path)
+                    _log(f"  🔎 Added to OCR queue for later processing")
                 mark_as_ingested(already_ingested, pdf_path, 0)
                 continue
 
             meta    = extract_metadata_from_filename(file)
             text_p1 = pages[0].page_content if pages else ""
             journal, doi = extract_journal_doi(text_p1)
+            doc_type = detect_doc_type(file, num_pages, raw_text)
 
             meta_label = f"{meta['auteur']} ({meta['annee']})"
             if journal:
                 meta_label += f"  —  {journal[:45]}"
+            if doc_type == "thesis":
+                meta_label += "  📖 [THESIS]"
             _log(f"  🏷️  {meta_label}")
 
             metadata_base = {
@@ -595,11 +950,16 @@ def main():
                 "titre":     meta["titre"],
                 "journal":   journal,
                 "doi":       doi,
+                "doc_type":  doc_type,
             }
 
             chunks, is_fallback, grobid_status = create_article_chunks(
                 pdf_path, raw_text, metadata_base, splitter
             )
+
+            # ── v1.5: tag each chunk with its sequence number (windowed retrieval) ──
+            for _seq, _doc in enumerate(chunks):
+                _doc.metadata["chunk_seq"] = _seq
 
             if is_fallback:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:

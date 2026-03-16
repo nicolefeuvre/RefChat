@@ -27,9 +27,11 @@ from refchat_llm import (
     detecter_mode, extraire_nom_auteur,
     chercher_par_auteur, recuperer_articles_complets,
     chercher_semantic_scholar,
-    format_docs, expand_query, charger_llm,
+    format_docs, expand_query, charger_llm, charger_bm25,
     extraire_mots_cles_llm,
-    lister_themes, recuperer_articles_par_theme, detecter_theme_query,
+    lister_themes, recuperer_articles_par_theme,
+    detecter_theme_query, detecter_theme_semantique,
+    hyde_generate, get_article_details,
 )
 import refchat_config as cfg
 
@@ -37,11 +39,17 @@ app = Flask(__name__)
 
 MAX_HISTORY          = 3
 conversation_history = []
+CONVERSATIONS_DIR    = cfg.PERSONAL_DATA / "refchat_conversations"
+
+# ── v1.5 feature flags ──────────────────────────────────────────────────────
+# HyDE is OFF by default — adds ~1-2s latency but improves retrieval quality.
+HYDE_ENABLED         = False
 
 STATE = {
     "db": None, "llm": None, "nom_llm": None,
     "ready": False, "error": None, "modele": "api",
     "MAX_ARTICLES": 3, "MAX_CHUNKS_ARTICLE": 5, "K_INITIAL": 8,
+    "bm25": None, "reranker": None,
     "memory_enabled": False,
     # Ingestion
     "ingest_running": False,
@@ -52,18 +60,70 @@ STATE = {
     "theme_log":     [],
     "theme_done":    False,
     "theme_error":   None,
+    # Thématisation — prévisualisation (dry-run)
+    "theme_preview_running": False,
+    "theme_preview_done":    False,
+    "theme_preview_log":     [],
+    "theme_preview_error":   None,
+    "theme_preview_result":  None,   # dict retourné par run_clustering_preview()
+    # Thématisation — validation (écriture DB)
+    "theme_validate_running": False,
+    "theme_validate_done":    False,
+    "theme_validate_log":     [],
+    "theme_validate_error":   None,
+    # Audit
+    "audit_running": False,
+    "audit_log":     [],
+    "audit_done":    False,
+    "audit_error":   None,
+    # OCR
+    "ocr_running": False,
+    "ocr_log":     [],
+    "ocr_done":    False,
+    "ocr_error":   None,
+    "ocr_stats":   None,   # {"total": N, "success": N, "failed": N, "skipped": N}
+    # v1.5 — conversation session tracking (used by auto-save)
+    "current_session_id":   None,   # str timestamp used as filename key
+    "current_session_msgs": [],     # [{role, content, sources, mode, elapsed}]
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_db_path():
-    return cfg.get("db_path", str(pathlib.Path(__file__).parent / "chroma_db"))
+    return cfg.get("db_path", str(cfg.PERSONAL_DATA / "chroma_db"))
+
+def _detect_device_and_batch():
+    """Auto-detect best compute device + safe batch size for the embedding model.
+    Priority: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
+    CUDA batch size is scaled to available VRAM to avoid OOM on small GPUs.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if   vram_gb >= 8: batch = 512
+                elif vram_gb >= 6: batch = 256
+                elif vram_gb >= 4: batch = 128
+                else:              batch = 64
+            except Exception:
+                batch = 128
+            return "cuda", batch
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps", 128   # Apple Silicon — unified memory, conservative default
+    except ImportError:
+        pass
+    return "cpu", 256
+
 
 def get_embedding():
+    device, batch_size = _detect_device_and_batch()
+    if device != "cpu":
+        print(f"⚡ Embeddings: {device.upper()} — batch_size={batch_size}")
     return HuggingFaceEmbeddings(
         model_name=cfg.EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True, "batch_size": 256},
+        model_kwargs={"device": device},
+        encode_kwargs={"normalize_embeddings": True, "batch_size": batch_size},
     )
 
 def init_system(modele="api"):
@@ -84,6 +144,15 @@ def init_system(modele="api"):
         db_path = get_db_path()
         STATE["db"]  = Chroma(persist_directory=db_path, embedding_function=get_embedding())
         STATE["llm"], STATE["nom_llm"] = charger_llm(modele)
+        STATE["bm25"] = charger_bm25(STATE["db"])
+
+        try:
+            from sentence_transformers import CrossEncoder
+            # Multilingual MS MARCO cross-encoder (~120 MB) — reranks top candidates
+            # for maximum precision on FR/EN mixed libraries.
+            STATE["reranker"] = CrossEncoder("nreimers/mmarco-mMiniLMv2-L12-H384-v1")
+        except Exception:
+            STATE["reranker"] = None  # optional — falls back to RRF ranking
 
         if modele != "api":
             import urllib.request as _ur
@@ -187,6 +256,179 @@ def api_theme_status():
         "log":     STATE["theme_log"][-100:],
     })
 
+
+# ── Thématisation : prévisualisation (dry-run) ─────────────────────────────────
+
+@app.route("/api/theme/preview", methods=["POST"])
+def api_theme_preview():
+    """Lance le clustering BERTopic en mode dry-run et retourne la prévisualisation."""
+    if STATE["theme_preview_running"]:
+        return jsonify({"success": False, "error": "Prévisualisation déjà en cours"})
+    db = STATE["db"]
+    if not db:
+        return jsonify({"success": False, "error": "Base non initialisée"})
+    data     = request.get_json() or {}
+    n_topics = data.get("n_topics") or None
+    min_docs = int(data.get("min_docs", 5))
+    STATE.update({
+        "theme_preview_running": True,
+        "theme_preview_done":    False,
+        "theme_preview_log":     [],
+        "theme_preview_error":   None,
+        "theme_preview_result":  None,
+    })
+    def run():
+        try:
+            import refchat_theme as _rt
+            def log_cb(msg):
+                STATE["theme_preview_log"].append(str(msg))
+            result = _rt.run_clustering_preview(
+                db=db, n_topics=n_topics, min_docs=min_docs, log_cb=log_cb
+            )
+            if "error" in result:
+                STATE["theme_preview_error"] = result["error"]
+            else:
+                STATE["theme_preview_result"] = result
+        except Exception as e:
+            STATE["theme_preview_error"] = str(e)
+        finally:
+            STATE["theme_preview_running"] = False
+            STATE["theme_preview_done"]    = True
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route("/api/theme/preview/status")
+def api_theme_preview_status():
+    return jsonify({
+        "running": STATE["theme_preview_running"],
+        "done":    STATE["theme_preview_done"],
+        "error":   STATE["theme_preview_error"],
+        "log":     STATE["theme_preview_log"][-100:],
+        "result":  STATE["theme_preview_result"],   # None tant que pas terminé
+    })
+
+
+# ── Thématisation : validation (écriture DB) ──────────────────────────────────
+
+@app.route("/api/theme/validate", methods=["POST"])
+def api_theme_validate():
+    """Écrit un mapping filename→thème validé par l'utilisateur dans ChromaDB."""
+    if STATE["theme_validate_running"]:
+        return jsonify({"success": False, "error": "Validation déjà en cours"})
+    db = STATE["db"]
+    if not db:
+        return jsonify({"success": False, "error": "Base non initialisée"})
+    data = request.get_json() or {}
+    filename_to_theme = data.get("filename_to_theme")
+    if not filename_to_theme:
+        return jsonify({"success": False, "error": "Paramètre filename_to_theme manquant"})
+    STATE.update({
+        "theme_validate_running": True,
+        "theme_validate_done":    False,
+        "theme_validate_log":     [],
+        "theme_validate_error":   None,
+    })
+    def run():
+        try:
+            import refchat_theme as _rt
+            def log_cb(msg):
+                STATE["theme_validate_log"].append(str(msg))
+            _rt.apply_theme_mapping(filename_to_theme, db=db, log_cb=log_cb)
+        except Exception as e:
+            STATE["theme_validate_error"] = str(e)
+        finally:
+            STATE["theme_validate_running"] = False
+            STATE["theme_validate_done"]    = True
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route("/api/theme/validate/status")
+def api_theme_validate_status():
+    return jsonify({
+        "running": STATE["theme_validate_running"],
+        "done":    STATE["theme_validate_done"],
+        "error":   STATE["theme_validate_error"],
+        "log":     STATE["theme_validate_log"][-100:],
+    })
+
+
+# ── Thèmes avec liste d'articles (pour sidebar accordéon) ────────────────────
+
+@app.route("/api/themes/articles")
+def api_themes_articles():
+    """
+    Retourne les thèmes avec leur liste d'articles — lit depuis refchat_themes.json
+    si disponible (rapide), sinon scanne ChromaDB.
+    """
+    import refchat_config as _cfg
+    map_path = pathlib.Path(_cfg.PERSONAL_DATA) / "refchat_themes.json"
+    try:
+        if map_path.exists():
+            with open(map_path, encoding="utf-8") as f:
+                data = json.load(f)
+            theme_map    = data.get("theme_map", {})       # fname→theme
+            themes_dict  = data.get("themes", {})          # theme→[fnames]
+            # Enrichir avec métadonnées depuis ChromaDB si dispo
+            db = STATE["db"]
+            meta_cache: dict = {}
+            if db:
+                try:
+                    total = db._collection.count()
+                    for offset in range(0, min(total, 10000), 2000):
+                        r = db._collection.get(
+                            limit=2000, offset=offset, include=["metadatas"]
+                        )
+                        for m in r["metadatas"]:
+                            fname = m.get("filename", "")
+                            if fname and fname not in meta_cache:
+                                meta_cache[fname] = m
+                except Exception:
+                    pass
+            themes_out = []
+            for theme, fnames in sorted(themes_dict.items(), key=lambda x: -len(x[1])):
+                articles = []
+                for fname in fnames:
+                    m = meta_cache.get(fname, {})
+                    articles.append({
+                        "fname":  fname,
+                        "auteur": m.get("auteur", ""),
+                        "annee":  m.get("annee",  ""),
+                        "titre":  m.get("titre",  ""),
+                    })
+                themes_out.append({"name": theme, "count": len(fnames), "articles": articles})
+            return jsonify({"themes": themes_out, "source": "json"})
+    except Exception:
+        pass
+
+    # Fallback : scan ChromaDB
+    db = STATE["db"]
+    if not db:
+        return jsonify({"themes": [], "error": "Base non initialisée"})
+    try:
+        total = db._collection.count()
+        theme_articles: dict = {}
+        for offset in range(0, total, 2000):
+            r = db._collection.get(limit=2000, offset=offset, include=["metadatas"])
+            for m in r["metadatas"]:
+                t = m.get("theme", "")
+                if not t:
+                    continue
+                fname = m.get("filename", "")
+                if fname and fname not in theme_articles.get(t, {}):
+                    theme_articles.setdefault(t, {})[fname] = m
+        themes_out = []
+        for theme, art_dict in sorted(theme_articles.items(), key=lambda x: -len(x[1])):
+            articles = [
+                {"fname": f, "auteur": m.get("auteur",""), "annee": m.get("annee",""),
+                 "titre": m.get("titre","")}
+                for f, m in art_dict.items()
+            ]
+            themes_out.append({"name": theme, "count": len(articles), "articles": articles})
+        return jsonify({"themes": themes_out, "source": "chromadb"})
+    except Exception as e:
+        return jsonify({"themes": [], "error": str(e)})
 
 
 @app.route("/api/hardware/detect")
@@ -342,6 +584,7 @@ def api_config_get():
         "num_batch":                c.get("num_batch", ""),
         "ollama_num_ctx_local":     c.get("ollama_num_ctx_local", 4096),
         "ollama_temperature":       c.get("ollama_temperature", 0.1),
+        "bm25_weight":              c.get("bm25_weight", 0.3),
     })
 
 @app.route("/api/config", methods=["POST"])
@@ -350,13 +593,15 @@ def api_config_save():
     try:
         allowed = ("zotero_path","db_path","llm_model","mistral_api_key",
                    "semantic_scholar_api_key","num_thread","num_gpu","num_batch",
-                   "ollama_num_ctx_local","ollama_temperature")
+                   "ollama_num_ctx_local","ollama_temperature","bm25_weight")
         updates = {k: data[k] for k in allowed if k in data}
         for k in ("num_thread","num_gpu","num_batch","ollama_num_ctx_local"):
             if k in updates and str(updates[k]).strip() != "":
                 updates[k] = int(updates[k])
         if "ollama_temperature" in updates and str(updates["ollama_temperature"]).strip() != "":
             updates["ollama_temperature"] = float(updates["ollama_temperature"])
+        if "bm25_weight" in updates and str(updates["bm25_weight"]).strip() != "":
+            updates["bm25_weight"] = float(updates["bm25_weight"])
         cfg.save(updates)
         return jsonify({"success": True})
     except Exception as e:
@@ -371,7 +616,7 @@ def api_ingest_scan():
     try:
         import refchat_ingest
         tous = refchat_ingest._scan_zotero_pdfs(zotero)
-        suivi_path = pathlib.Path(__file__).parent / "refchat_index_db.json"
+        suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
         # Already processed = indexed OR explicitly rejected (chunks=0 means rejected/blacklisted)
         deja = set()
         if suivi_path.exists():
@@ -431,7 +676,7 @@ def api_ingest_scan_full():
     try:
         import refchat_ingest
         tous = refchat_ingest._scan_zotero_pdfs(zotero)
-        suivi_path = pathlib.Path(__file__).parent / "refchat_index_db.json"
+        suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
         deja = set()
         if suivi_path.exists():
             try:
@@ -456,6 +701,124 @@ def api_ingest_scan_full():
         return jsonify({"nouveaux": nouveaux})
     except Exception as e:
         return jsonify({"nouveaux": [], "erreur": str(e)})
+
+@app.route("/api/db/articles")
+def api_db_articles():
+    """List all currently indexed articles with metadata (from tracking file + ChromaDB)."""
+    db = STATE["db"]
+    if not db:
+        return jsonify({"articles": [], "total": 0, "error": "DB not loaded"})
+    try:
+        suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
+        suivi = {}
+        if suivi_path.exists():
+            with open(suivi_path, encoding="utf-8") as f:
+                suivi = json.load(f)
+
+        # Build base info from tracking file (full path → info)
+        fname_info = {}
+        for path, info in suivi.items():
+            if not isinstance(info, dict):
+                continue
+            chunks = info.get("chunks", 0)
+            if chunks == 0:
+                continue  # blacklisted / rejected
+            fn = os.path.basename(path)
+            if fn not in fname_info:
+                fname_info[fn] = {
+                    "filename": fn,
+                    "nb_chunks": chunks,
+                    "date": info.get("date", ""),
+                    "auteur": "", "annee": "", "titre": "", "doc_type": "article",
+                }
+
+        if fname_info:
+            # Enrich with ChromaDB metadata (metadatas only, no documents — fast)
+            total = db._collection.count()
+            enriched = 0
+            for offset in range(0, total, 2000):
+                r = db._collection.get(limit=2000, offset=offset, include=["metadatas"])
+                for meta in r["metadatas"]:
+                    fn = meta.get("filename", "")
+                    if fn in fname_info and not fname_info[fn]["auteur"]:
+                        fname_info[fn]["auteur"]   = meta.get("auteur", "")
+                        fname_info[fn]["annee"]    = meta.get("annee", "")
+                        fname_info[fn]["titre"]    = meta.get("titre", "")
+                        fname_info[fn]["doc_type"] = meta.get("doc_type", "article")
+                        enriched += 1
+                if enriched >= len(fname_info):
+                    break  # all articles enriched, stop early
+
+        articles = sorted(fname_info.values(), key=lambda x: (x.get("auteur") or x["filename"]).lower())
+        return jsonify({"articles": articles, "total": len(articles)})
+    except Exception as e:
+        return jsonify({"articles": [], "total": 0, "error": str(e)})
+
+
+@app.route("/api/db/delete", methods=["POST"])
+def api_db_delete():
+    """Delete articles from ChromaDB + add to blacklist + remove from tracking file."""
+    data = request.get_json() or {}
+    filenames = data.get("filenames", [])
+    if not filenames:
+        return jsonify({"success": False, "error": "No filenames provided"})
+    db = STATE["db"]
+    if not db:
+        return jsonify({"success": False, "error": "Database not loaded"})
+
+    errors = []
+
+    # 1. Delete all chunks from ChromaDB
+    for fname in filenames:
+        try:
+            db._collection.delete(where={"filename": fname})
+        except Exception as e:
+            errors.append(f"{fname}: {e}")
+
+    # 2. Add to blacklist (refchat_ignore.txt stays next to scripts)
+    ignore_path = pathlib.Path(__file__).parent / "refchat_ignore.txt"
+    existing = set()
+    if ignore_path.exists():
+        with open(ignore_path, encoding="utf-8") as f:
+            existing = {l.strip() for l in f if l.strip()}
+    new_entries = [fn for fn in filenames if fn not in existing]
+    if new_entries:
+        with open(ignore_path, "a", encoding="utf-8") as f:
+            for fn in new_entries:
+                f.write(fn + "\n")
+
+    # 3. Remove from tracking file
+    suivi_path = cfg.PERSONAL_DATA / "refchat_index_db.json"
+    if suivi_path.exists():
+        try:
+            with open(suivi_path, encoding="utf-8") as f:
+                tracking = json.load(f)
+            if isinstance(tracking, dict):
+                fnames_set = set(filenames)
+                keys_to_remove = [k for k in tracking if os.path.basename(k) in fnames_set]
+                for k in keys_to_remove:
+                    del tracking[k]
+                with open(suivi_path, "w", encoding="utf-8") as f:
+                    json.dump(tracking, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            errors.append(f"tracking update: {e}")
+
+    # 4. Invalidate BM25 cache (will be rebuilt on next query)
+    bm25_cache = cfg.PERSONAL_DATA / "bm25_index.pkl"
+    if bm25_cache.exists():
+        try:
+            bm25_cache.unlink()
+            STATE["bm25"] = None  # force rebuild in memory too
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": len(errors) == 0,
+        "deleted": len(filenames),
+        "blacklisted": len(new_entries),
+        "errors": errors,
+    })
+
 
 @app.route("/api/ingest/start", methods=["POST"])
 def api_ingest_start():
@@ -503,6 +866,109 @@ def api_ingest_status():
         "log":     STATE["ingest_log"][-150:],
     })
 
+@app.route("/api/audit/fix-abstracts", methods=["POST"])
+def api_audit_fix_abstracts():
+    if STATE["audit_running"]:
+        return jsonify({"success": False, "error": "Audit already in progress"})
+    if not STATE["db"]:
+        return jsonify({"success": False, "error": "Database not loaded — start the app first"})
+
+    STATE.update({"audit_running": True, "audit_log": [],
+                  "audit_done": False, "audit_error": None})
+
+    def run():
+        try:
+            from Audit_database import auto_fix_abstracts
+            zotero_path = cfg.get("zotero_path", "")
+
+            def log_cb(msg):
+                STATE["audit_log"].append(msg.rstrip())
+
+            auto_fix_abstracts(STATE["db"], zotero_path=zotero_path, log_callback=log_cb)
+            STATE["audit_done"] = True
+        except Exception as e:
+            STATE["audit_error"] = str(e)
+            STATE["audit_done"]  = True
+        finally:
+            STATE["audit_running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+@app.route("/api/audit/status")
+def api_audit_status():
+    return jsonify({
+        "running": STATE["audit_running"],
+        "done":    STATE["audit_done"],
+        "error":   STATE["audit_error"],
+        "log":     STATE["audit_log"][-150:],
+    })
+
+@app.route("/api/ocr/queue")
+def api_ocr_queue():
+    """Returns the current OCR queue (image PDFs awaiting OCR)."""
+    from refchat_ingest import _load_ocr_queue
+    queue = _load_ocr_queue()
+    return jsonify({"count": len(queue), "items": list(queue.keys())})
+
+@app.route("/api/ocr/start", methods=["POST"])
+def api_ocr_start():
+    if STATE["ocr_running"]:
+        return jsonify({"success": False, "error": "OCR already in progress"})
+    if not STATE["db"]:
+        return jsonify({"success": False, "error": "Database not loaded — start the app first"})
+
+    from refchat_ingest import _load_ocr_queue, run_ocr_ingest
+    queue = _load_ocr_queue()
+    if not queue:
+        return jsonify({"success": False, "error": "No PDFs in the OCR queue"})
+
+    STATE.update({"ocr_running": True, "ocr_log": [],
+                  "ocr_done": False, "ocr_error": None, "ocr_stats": None})
+
+    def run():
+        stats = {"total": len(queue), "success": 0, "failed": 0, "skipped": 0}
+        try:
+            def log_cb(msg):
+                STATE["ocr_log"].append(msg.rstrip())
+
+            log_cb(f"🔎 Starting OCR for {stats['total']} PDF(s)…")
+
+            for filename, pdf_path in list(queue.items()):
+                if not pathlib.Path(pdf_path).exists():
+                    log_cb(f"⚠️  File not found, skipping: {filename[:60]}")
+                    stats["skipped"] += 1
+                    continue
+                result = run_ocr_ingest(pdf_path, STATE["db"], log_cb=log_cb)
+                if result["success"]:
+                    stats["success"] += 1
+                else:
+                    stats["failed"] += 1
+                log_cb("")
+
+            STATE["ocr_stats"] = stats
+            log_cb(f"✅ OCR complete — {stats['success']}/{stats['total']} indexed, "
+                   f"{stats['failed']} failed, {stats['skipped']} skipped")
+            STATE["ocr_done"] = True
+        except Exception as e:
+            STATE["ocr_error"] = str(e)
+            STATE["ocr_done"]  = True
+        finally:
+            STATE["ocr_running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"success": True})
+
+@app.route("/api/ocr/status")
+def api_ocr_status():
+    return jsonify({
+        "running": STATE["ocr_running"],
+        "done":    STATE["ocr_done"],
+        "error":   STATE["ocr_error"],
+        "stats":   STATE["ocr_stats"],
+        "log":     STATE["ocr_log"][-150:],
+    })
+
 @app.route("/api/init", methods=["POST"])
 def api_init():
     data   = request.json or {}
@@ -531,6 +997,115 @@ def api_quit():
         time.sleep(0.5); os._exit(0)
     threading.Thread(target=shutdown, daemon=True).start()
     return jsonify({"ok": True})
+
+
+# ── v1.5 — Conversation persistence helpers ───────────────────────────────────
+
+def _autosave_session():
+    """Write current session messages to disk (called in a background thread)."""
+    try:
+        sid  = STATE.get("current_session_id")
+        msgs = STATE.get("current_session_msgs", [])
+        if not sid or not msgs:
+            return
+        CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = CONVERSATIONS_DIR / f"{sid}.json"
+        # Build a readable title from the first user message
+        first_user = next((m["content"] for m in msgs if m["role"] == "user"), "")
+        title = first_user[:80].strip().replace("\n", " ")
+        data = {
+            "id":       sid,
+            "title":    title,
+            "date":     sid.replace("_", " ").replace("-", "/", 2),
+            "messages": msgs,
+        }
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  Autosave session failed: {e}")
+
+
+# ── v1.5 — API: Conversations ─────────────────────────────────────────────────
+
+@app.route("/api/conversations")
+def api_conversations_list():
+    """Return the list of saved conversation sessions (most recent first)."""
+    try:
+        CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        sessions = []
+        for p in sorted(CONVERSATIONS_DIR.glob("*.json"), reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                sessions.append({
+                    "id":    data.get("id", p.stem),
+                    "title": data.get("title", p.stem),
+                    "date":  data.get("date", ""),
+                    "n":     len([m for m in data.get("messages", []) if m["role"] == "user"]),
+                })
+            except Exception:
+                pass
+        return jsonify({"sessions": sessions})
+    except Exception as e:
+        return jsonify({"sessions": [], "error": str(e)})
+
+
+@app.route("/api/conversations/<session_id>")
+def api_conversation_load(session_id):
+    """Load a saved conversation session by ID."""
+    # Sanitize to prevent path traversal
+    safe_id = pathlib.Path(session_id).name
+    path = CONVERSATIONS_DIR / f"{safe_id}.json"
+    if not path.exists():
+        return jsonify({"error": "Session not found"}), 404
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/conversations/<session_id>", methods=["DELETE"])
+def api_conversation_delete(session_id):
+    """Delete a saved conversation session by ID."""
+    safe_id = pathlib.Path(session_id).name
+    path = CONVERSATIONS_DIR / f"{safe_id}.json"
+    if path.exists():
+        path.unlink()
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Not found"}), 404
+
+
+@app.route("/api/conversations/new", methods=["POST"])
+def api_conversation_new():
+    """Start a new conversation session (clears current session state)."""
+    global conversation_history
+    conversation_history = []
+    STATE["current_session_id"]   = None
+    STATE["current_session_msgs"] = []
+    return jsonify({"success": True})
+
+
+# ── v1.5 — API: Article detail ────────────────────────────────────────────────
+
+@app.route("/api/article/<path:filename>")
+def api_article_detail(filename):
+    """Return full metadata + abstract for a given article filename."""
+    db = STATE["db"]
+    if not db:
+        return jsonify({"error": "Database not loaded"}), 503
+    result = get_article_details(db, filename)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+# ── v1.5 — API: HyDE toggle ──────────────────────────────────────────────────
+
+@app.route("/api/hyde/toggle", methods=["POST"])
+def api_hyde_toggle():
+    global HYDE_ENABLED
+    data = request.get_json() or {}
+    HYDE_ENABLED = bool(data.get("enabled", not HYDE_ENABLED))
+    return jsonify({"hyde_enabled": HYDE_ENABLED})
 
 
 @app.route("/api/open-pdf", methods=["POST"])
@@ -563,7 +1138,8 @@ def api_chat():
     
     data = request.json or {}
     query = data.get("query", "").strip()
-    web_search_requested = data.get("web_search", False)
+    web_search_requested  = data.get("web_search", False)
+    active_theme_filter   = data.get("active_theme_filter") or None  # filtre persistant sidebar
     
     if not query:
         return jsonify({"error": "Question vide."}), 400
@@ -591,9 +1167,17 @@ def api_chat():
 
             def _run_rag():
                 try:
-                    # -- Detection de theme --
-                    themes_dispo  = lister_themes(db)
-                    theme_detecte = detecter_theme_query(query, themes_dispo)
+                    # -- Détection de thème --
+                    # Priorité : 1. filtre actif (clic sidebar) → 2. sémantique → 3. mots-clés
+                    themes_dispo = lister_themes(db)
+                    if active_theme_filter:
+                        theme_detecte = active_theme_filter
+                    else:
+                        emb_fn = getattr(db, "embedding_function", None)
+                        theme_detecte = (
+                            detecter_theme_semantique(query, themes_dispo, emb_fn)
+                            or detecter_theme_query(query, themes_dispo)
+                        )
 
                     if mode == "auteur":
                         nom = extraire_nom_auteur(query)
@@ -621,6 +1205,14 @@ def api_chat():
                         prompt_actif   = build_prompt_with_history(prompt_base, history_to_send)
                         query_enrichie = expand_query(query)
 
+                        # ── v1.5 HyDE: replace query embedding with hypothetical passage ──
+                        if HYDE_ENABLED and mode == "question":
+                            hyde_text = hyde_generate(query, llm)
+                            if hyde_text != query:
+                                from refchat_config import EMBEDDING_MODEL as _EM
+                                prefix = "passage: " if "e5" in _EM.lower() else ""
+                                query_enrichie = prefix + hyde_text
+
                         if web_search_requested == "only":
                             query_ss = extraire_mots_cles_llm(query, llm)
                             docs_web, nb_web_total_local = chercher_semantic_scholar(query_ss, limit=10)
@@ -631,7 +1223,15 @@ def api_chat():
                         else:
                             ma_eff  = max(2, max_articles // 2) if (web_search_requested and STATE["modele"] != "api") else max_articles
                             mca_eff = max(3, max_chunks_art // 2) if (web_search_requested and STATE["modele"] != "api") else max_chunks_art
-                            ai_local, docs = recuperer_articles_complets(db, query_enrichie, k_initial=k_initial_val, max_articles=ma_eff, max_chunks_par_article=mca_eff)
+                            bm25_w = float(cfg.get("bm25_weight", 0.3))
+                            ai_local, docs = recuperer_articles_complets(
+                                db, query_enrichie,
+                                bm25_retriever=STATE["bm25"], bm25_weight=bm25_w,
+                                k_initial=k_initial_val, max_articles=ma_eff,
+                                max_chunks_par_article=mca_eff,
+                                reranker=STATE["reranker"],
+                                theme_filter=theme_detecte,  # filtre thématique silencieux
+                            )
                             nb_web_total_local = 0
                             if web_search_requested:
                                 query_ss = extraire_mots_cles_llm(query, llm)
@@ -692,6 +1292,25 @@ def api_chat():
                 if len(conversation_history) > MAX_HISTORY * 2:
                     conversation_history = conversation_history[-(MAX_HISTORY*2):]
 
+            # ── v1.5: accumulate session messages for persistence ──
+            if STATE["current_session_id"] is None:
+                import datetime as _dt
+                STATE["current_session_id"] = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                STATE["current_session_msgs"] = []
+            STATE["current_session_msgs"].append({"role": "user",      "content": query})
+            STATE["current_session_msgs"].append({
+                "role":    "assistant",
+                "content": full_response,
+                "mode":    mode,
+                "elapsed": round(time.time() - t_start, 1),
+            })
+            # Auto-save to disk (fire-and-forget)
+            try:
+                import threading as _th
+                _th.Thread(target=_autosave_session, daemon=True).start()
+            except Exception:
+                pass
+
             seen = set()
             for doc in docs:
                 m   = doc.metadata
@@ -715,11 +1334,13 @@ def api_chat():
                         "url":        pdf_path,
                         "doi":        m.get("doi", ""),
                         "zotero_link": file_link,
+                        "filename":   m.get("filename", ""),   # v1.5: for article detail panel
                     })
 
             articles_out = [{"auteur": a.get("auteur","?"), "annee": a.get("annee","?"),
                              "titre": (a.get("titre") or a.get("filename","?"))[:80],
-                             "nb_chunks": a.get("nb_chunks",0), "score": a.get("score",0)}
+                             "nb_chunks": a.get("nb_chunks",0), "score": a.get("score",0),
+                             "filename": a.get("filename", "")}  # v1.5: for article detail panel
                             for a in articles_info]
 
             chars_history = sum(len(m["content"]) for m in history_to_send)
@@ -864,6 +1485,69 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   @media (max-width:700px) { #sidebar { display:none; } }
 
+  /* Sidebar — accordéon thèmes */
+  .theme-accordion-item { border:1px solid var(--border); border-radius:7px; margin-bottom:4px; overflow:hidden; }
+  .theme-accordion-header { display:flex; align-items:center; justify-content:space-between; padding:6px 9px; cursor:pointer; background:var(--bg3); transition:background 0.15s; gap:6px; }
+  .theme-accordion-header:hover { background:#1e2a1e; }
+  .theme-accordion-header.active { background:#1a2a1a; border-bottom:1px solid var(--border); }
+  .theme-acc-name { font-size:0.72rem; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+  .theme-acc-count { font-size:0.65rem; color:var(--text3); font-family:'DM Mono',monospace; flex-shrink:0; }
+  .theme-acc-chevron { font-size:0.6rem; color:var(--text3); flex-shrink:0; transition:transform 0.2s; }
+  .theme-accordion-body { display:none; padding:4px 6px; max-height:180px; overflow-y:auto; }
+  .theme-acc-art { font-size:0.68rem; color:var(--text2); padding:3px 4px; border-radius:4px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .theme-acc-art:hover { background:var(--bg3); color:var(--accent2); }
+  .theme-acc-filter-btn { display:block; width:100%; margin-top:4px; background:transparent; border:1px solid var(--border); color:var(--accent2); font-size:0.68rem; padding:3px 6px; border-radius:4px; cursor:pointer; font-family:'Figtree',sans-serif; }
+  .theme-acc-filter-btn:hover { background:#1a2a1a; }
+
+  /* Badge filtre actif */
+  #active-filter-bar { display:none; align-items:center; gap:8px; padding:5px 16px; background:#0d1f17; border-bottom:1px solid var(--accent2); font-size:0.75rem; color:var(--accent2); }
+  #active-filter-bar .af-label { flex:1; }
+  #active-filter-bar .af-clear { background:transparent; border:none; color:var(--accent2); cursor:pointer; font-size:0.85rem; padding:0 4px; opacity:0.7; }
+  #active-filter-bar .af-clear:hover { opacity:1; }
+
+  /* Modal validation thèmes */
+  #theme-validate-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:300; align-items:flex-start; justify-content:center; padding-top:40px; overflow-y:auto; }
+  .tv-box { background:var(--bg2); border:1px solid var(--border); border-radius:14px; width:780px; max-width:96vw; margin:0 auto 40px; display:flex; flex-direction:column; max-height:88vh; }
+  .tv-header { display:flex; align-items:center; justify-content:space-between; padding:18px 24px 12px; border-bottom:1px solid var(--border); flex-shrink:0; }
+  .tv-title { font-family:'DM Serif Display',serif; font-size:1.3rem; color:var(--text); }
+  .tv-stats { font-size:0.75rem; color:var(--text3); font-family:'DM Mono',monospace; }
+  .tv-close { background:transparent; border:none; color:var(--text3); font-size:1.2rem; cursor:pointer; }
+  .tv-actions { display:flex; gap:8px; padding:10px 24px; border-bottom:1px solid var(--border); flex-shrink:0; flex-wrap:wrap; align-items:center; }
+  .tv-btn { padding:6px 14px; border-radius:7px; font-size:0.78rem; cursor:pointer; font-family:'Figtree',sans-serif; }
+  .tv-btn-primary { background:var(--accent2); color:#0d1117; border:none; font-weight:600; }
+  .tv-btn-primary:hover { opacity:0.85; }
+  .tv-btn-secondary { background:transparent; border:1px solid var(--border); color:var(--text2); }
+  .tv-btn-secondary:hover { border-color:var(--accent); color:var(--text); }
+  .tv-btn-danger { background:transparent; border:1px solid #f85149; color:#f85149; }
+  .tv-btn-danger:hover { background:#f8514922; }
+  .tv-issues-bar { padding:6px 24px; font-size:0.73rem; background:#1a1200; color:#ffa657; border-bottom:1px solid #3a2a00; flex-shrink:0; }
+  .tv-list { flex:1; overflow-y:auto; padding:12px 16px; display:flex; flex-direction:column; gap:8px; }
+  .tv-card { background:var(--bg3); border:1px solid var(--border); border-radius:9px; padding:10px 12px; }
+  .tv-card.has-issues { border-color:#ffa65744; }
+  .tv-card.is-parasitic { border-color:#f8514944; }
+  .tv-card.is-deleted { opacity:0.4; }
+  .tv-card-top { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .tv-name-input { flex:1; background:var(--bg2); border:1px solid var(--border); color:var(--text); font-size:0.82rem; padding:5px 9px; border-radius:6px; font-family:'Figtree',sans-serif; min-width:0; }
+  .tv-name-input:focus { outline:2px solid var(--accent); border-color:transparent; }
+  .tv-count-badge { font-size:0.68rem; color:var(--text3); font-family:'DM Mono',monospace; white-space:nowrap; flex-shrink:0; }
+  .tv-del-btn { background:transparent; border:1px solid var(--border); color:var(--text3); border-radius:5px; width:28px; height:28px; cursor:pointer; font-size:0.85rem; flex-shrink:0; }
+  .tv-del-btn:hover { border-color:#f85149; color:#f85149; }
+  .tv-restore-btn { background:transparent; border:1px solid var(--border); color:var(--accent2); border-radius:5px; padding:2px 8px; font-size:0.72rem; cursor:pointer; }
+  .tv-issue-badges { display:flex; gap:4px; flex-wrap:wrap; margin-bottom:4px; }
+  .tv-issue-badge { font-size:0.62rem; padding:1px 7px; border-radius:3px; }
+  .tv-issue-badge.parasitic { background:#f8514922; color:#f85149; }
+  .tv-issue-badge.small     { background:#bc8cff22; color:#bc8cff; }
+  .tv-issue-badge.large     { background:#ffa65722; color:#ffa657; }
+  .tv-issue-badge.generic   { background:#58a6ff22; color:#58a6ff; }
+  .tv-suggestion { font-size:0.7rem; color:var(--text3); margin-bottom:4px; }
+  .tv-apply-btn { background:transparent; border:none; color:var(--accent); font-size:0.7rem; cursor:pointer; text-decoration:underline; padding:0; }
+  .tv-articles-details summary { font-size:0.7rem; color:var(--text3); cursor:pointer; padding:2px 0; }
+  .tv-articles-details div { max-height:120px; overflow-y:auto; padding-top:4px; }
+  .tv-art-line { font-size:0.7rem; color:var(--text2); padding:1px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tv-footer { padding:12px 24px; border-top:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+  .tv-progress { font-size:0.75rem; color:var(--text3); }
+  .tv-log-box { background:var(--bg3); border:1px solid var(--border); border-radius:6px; padding:8px 12px; font-size:0.7rem; color:var(--text2); font-family:'DM Mono',monospace; max-height:80px; overflow-y:auto; white-space:pre-wrap; margin-top:8px; display:none; }
+
   /* ═══ WIZARD PREMIER LANCEMENT ═══════════════════════════════════════════ */
   #wizard-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200; display:flex; align-items:center; justify-content:center; }
   #wizard-overlay.hidden { display:none; }
@@ -923,6 +1607,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .toast { position:fixed; bottom:24px; right:24px; padding:12px 20px; border-radius:8px; font-size:0.84rem; z-index:999; font-family:'Figtree',sans-serif; box-shadow:0 4px 20px rgba(0,0,0,0.4); pointer-events:none; }
   .toast.ok  { background:#1a3a2a; border:1px solid #3fb95066; color:var(--accent2); }
   .toast.err { background:#2d1515; border:1px solid #f8514966; color:#f85149; }
+
+  /* ═══ v1.5 — ARTICLE DETAIL PANEL ═══════════════════════════════════════ */
+  #article-panel { position:fixed; right:0; top:0; bottom:0; width:420px; max-width:95vw; background:var(--bg2); border-left:1px solid var(--border); z-index:500; display:flex; flex-direction:column; transform:translateX(100%); transition:transform 0.3s ease; box-shadow:-8px 0 32px rgba(0,0,0,0.5); }
+  #article-panel.open { transform:translateX(0); }
+  .ap-header { display:flex; align-items:flex-start; justify-content:space-between; padding:18px 20px 12px; border-bottom:1px solid var(--border); flex-shrink:0; gap:10px; }
+  .ap-title  { font-family:'DM Serif Display',serif; font-size:1.05rem; color:var(--text); line-height:1.35; flex:1; }
+  .ap-close  { background:transparent; border:none; color:var(--text3); font-size:1.1rem; cursor:pointer; flex-shrink:0; padding:2px 6px; border-radius:4px; }
+  .ap-close:hover { color:var(--text); background:var(--bg3); }
+  .ap-meta   { padding:12px 20px; border-bottom:1px solid var(--border); flex-shrink:0; display:flex; flex-direction:column; gap:5px; }
+  .ap-meta-row { display:flex; justify-content:space-between; font-size:0.78rem; }
+  .ap-meta-label { color:var(--text3); font-family:'DM Mono',monospace; }
+  .ap-meta-val   { color:var(--text2); font-weight:500; text-align:right; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ap-meta-val a { color:var(--accent); text-decoration:none; }
+  .ap-meta-val a:hover { text-decoration:underline; }
+  .ap-body   { flex:1; overflow-y:auto; padding:14px 20px; }
+  .ap-section-label { font-size:0.68rem; color:var(--text3); font-family:'DM Mono',monospace; text-transform:uppercase; letter-spacing:0.7px; margin-bottom:6px; }
+  .ap-abstract { font-size:0.85rem; color:var(--text2); line-height:1.65; }
+  .ap-sections { display:flex; flex-wrap:wrap; gap:4px; margin-top:12px; }
+  .ap-sec-chip { background:var(--bg3); border:1px solid var(--border); color:var(--text3); font-size:0.65rem; padding:2px 8px; border-radius:10px; font-family:'DM Mono',monospace; }
+  .ap-footer { padding:12px 20px; border-top:1px solid var(--border); flex-shrink:0; display:flex; gap:8px; }
+  .ap-btn { flex:1; padding:7px 12px; border-radius:7px; font-size:0.78rem; cursor:pointer; font-family:'Figtree',sans-serif; border:1px solid var(--border); background:transparent; color:var(--text2); text-align:center; }
+  .ap-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .ap-btn.primary { background:var(--accent); color:#0d1117; border:none; font-weight:600; }
+  .ap-btn.primary:hover { opacity:0.85; }
+  .source-tag.detail-link { cursor:pointer; }
+  .source-tag.detail-link:hover { border-color:var(--accent); color:var(--accent); background:#1f3a5f22; }
+
+  /* ═══ v1.5 — HISTORY SIDEBAR ════════════════════════════════════════════ */
+  .hist-item { display:flex; align-items:flex-start; gap:8px; padding:6px 8px; border-radius:6px; cursor:pointer; border:1px solid transparent; transition:background 0.12s; }
+  .hist-item:hover { background:var(--bg3); border-color:var(--border); }
+  .hist-item.active { background:#0d1f17; border-color:var(--accent2); }
+  .hist-item-body { flex:1; min-width:0; }
+  .hist-title { font-size:0.73rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .hist-date  { font-size:0.64rem; color:var(--text3); font-family:'DM Mono',monospace; margin-top:1px; }
+  .hist-del   { background:transparent; border:none; color:var(--text3); font-size:0.8rem; cursor:pointer; padding:2px 4px; border-radius:3px; flex-shrink:0; opacity:0; }
+  .hist-item:hover .hist-del { opacity:1; }
+  .hist-del:hover { color:#f85149; }
+
+  /* ═══ v1.5 — HyDE badge ═════════════════════════════════════════════════ */
+  #hyde-badge { display:inline-flex; align-items:center; gap:5px; background:var(--bg3); border:1px solid var(--border); color:var(--text3); font-size:0.72rem; padding:6px 10px; border-radius:8px; font-family:'DM Mono',monospace; cursor:pointer; margin-bottom:6px; width:100%; justify-content:center; transition:all 0.3s; }
+  #hyde-badge.active { border-color:#bc8cff44; color:#bc8cff; background:#2a1a3a; }
+  #hyde-badge .hyde-dot { width:8px; height:8px; border-radius:50%; background:var(--text3); transition:all 0.3s; }
+  #hyde-badge.active .hyde-dot { background:#bc8cff; box-shadow:0 0 6px #bc8cff; }
 </style>
 </head>
 <body>
@@ -1230,7 +1957,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="shint">VRAM-limited: 4GB&#8594;4096 &middot; 8GB&#8594;8192</div>
       </div>
     </div>
-
+    <hr class="s-sep">
+    <h3 style="font-size:1rem;margin-bottom:6px">🔀 Hybrid Search BM25 + Dense</h3>
+    <p style="font-size:0.78rem;color:var(--text2);margin-bottom:10px">
+      Combines keyword matching (BM25) with semantic search (E5). Higher BM25 weight
+      improves exact geographic/proper-noun recall. Requires <code>pip install rank-bm25</code>.
+    </p>
+    <div class="sfield">
+      <label>BM25 weight <span style="color:var(--accent2);font-size:0.7em">0 = dense only · 1 = BM25 only</span></label>
+      <input type="number" id="s-bm25-weight" placeholder="0.3" min="0" max="1" step="0.05" style="width:120px" />
+      <div class="shint">Recommended: 0.3 (70% dense / 30% BM25) — takes effect on next query, no restart needed</div>
+    </div>
 
     <div class="s-actions">
       <button class="s-btn primary" onclick="settingsSave()">💾 Save</button>
@@ -1249,7 +1986,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <p style="font-size:0.82rem;color:var(--text2);margin-bottom:12px">Indexes from the configured Zotero folder. Already-indexed articles are skipped.</p>
     <div class="s-actions">
       <button class="s-btn success" id="s-btn-ingest" onclick="settingsStartIngest()">▶ Start indexing</button>
+      <button class="s-btn secondary" onclick="openManageDB()" style="margin-top:8px">🗄️ Manage indexed articles</button>
+      <button class="s-btn secondary" id="s-btn-audit" onclick="auditFixAbstracts()" style="margin-top:8px">🔧 Fix missing abstracts</button>
     </div>
+    <div id="audit-log-box" style="display:none;margin-top:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--text2);max-height:180px;overflow-y:auto;white-space:pre-wrap"></div>
     <hr class="s-sep">
     <h3 style="font-size:1rem;margin-bottom:12px">🤖 Ollama Models</h3>
     <p style="font-size:0.82rem;color:var(--text2);margin-bottom:14px">Install or verify available local models.</p>
@@ -1260,6 +2000,78 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <button class="s-btn secondary" onclick="settingsRefreshModels()">🔄 Refresh</button>
     </div>
   </div>
+</div>
+
+<!-- ═══ THEME VALIDATION MODAL ══════════════════════════════════════════════ -->
+<div id="theme-validate-modal">
+  <div class="tv-box">
+    <div class="tv-header">
+      <div>
+        <div class="tv-title">🏷️ Organiser ma bibliothèque</div>
+        <div class="tv-stats" id="tv-stats"></div>
+      </div>
+      <button class="tv-close" onclick="closeTVModal()">✕</button>
+    </div>
+    <div class="tv-actions">
+      <button class="tv-btn tv-btn-primary" onclick="tvValidate()">✅ Valider et écrire dans la base</button>
+      <button class="tv-btn tv-btn-secondary" onclick="tvSelectAllWithIssues()">⚠️ Sélectionner les problèmes</button>
+      <button class="tv-btn tv-btn-danger" onclick="tvDeleteSelected()">🗑 Supprimer sélectionnés</button>
+      <span id="tv-sel-count" style="font-size:0.72rem;color:var(--text3);font-family:'DM Mono',monospace;margin-left:4px"></span>
+    </div>
+    <div id="tv-issues-bar" class="tv-issues-bar" style="display:none"></div>
+    <div class="tv-list" id="tv-list"></div>
+    <div class="tv-footer">
+      <div class="tv-progress" id="tv-progress"></div>
+      <div class="tv-log-box" id="tv-log"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ MANAGE DB MODAL ═══════════════════════════════════════════════════ -->
+<div id="manage-db-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:400;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;width:min(720px,96vw);max-height:88vh;display:flex;flex-direction:column;padding:24px;gap:14px">
+    <div style="display:flex;align-items:center;justify-content:space-between">
+      <h2 style="font-family:'DM Serif Display',serif;font-size:1.2rem;color:var(--accent)">🗄️ Manage indexed articles</h2>
+      <button onclick="closeManageDB()" style="background:none;border:none;color:var(--text2);cursor:pointer;font-size:1.3rem;line-height:1">✕</button>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <input id="mdb-search" type="text" placeholder="Filter by filename, author, year…" oninput="filterManageDB()"
+        style="flex:1;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-family:'Figtree',sans-serif;font-size:0.85rem">
+      <span id="mdb-count" style="font-size:0.75rem;color:var(--text3);white-space:nowrap;font-family:'DM Mono',monospace"></span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button onclick="mdbSelectAll()" class="s-btn secondary" style="font-size:0.73rem;padding:4px 10px">☑ All</button>
+      <button onclick="mdbSelectNone()" class="s-btn secondary" style="font-size:0.73rem;padding:4px 10px">☐ None</button>
+      <span id="mdb-selected-count" style="font-size:0.75rem;color:var(--text3);margin-left:auto;font-family:'DM Mono',monospace">0 selected</span>
+    </div>
+    <div id="mdb-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:3px;min-height:0;max-height:420px;padding-right:4px">
+      <div style="color:var(--text3);font-size:0.85rem;padding:20px;text-align:center">Loading…</div>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center;border-top:1px solid var(--border);padding-top:14px;flex-wrap:wrap">
+      <button onclick="mdbDeleteSelected()" id="mdb-btn-delete"
+        style="background:#da3633;color:#fff;border:none;padding:8px 18px;border-radius:8px;font-size:0.85rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif;transition:opacity 0.2s"
+        disabled>🗑️ Delete from DB &amp; blacklist</button>
+      <span style="font-size:0.73rem;color:var(--text3);line-height:1.4">Deleted articles are added to the blacklist and won't be re-indexed.<br>Remove them from <code style="font-family:'DM Mono',monospace">refchat_ignore.txt</code> to re-enable them.</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ v1.5 — ARTICLE DETAIL PANEL ════════════════════════════════════════ -->
+<div id="article-panel">
+  <div class="ap-header">
+    <div class="ap-title" id="ap-title">Article</div>
+    <button class="ap-close" onclick="closeArticlePanel()">✕</button>
+  </div>
+  <div class="ap-meta" id="ap-meta"></div>
+  <div class="ap-body" id="ap-body">
+    <div class="ap-section-label">Abstract</div>
+    <div class="ap-abstract" id="ap-abstract"><span style="color:var(--text3);font-style:italic">Loading…</span></div>
+    <div style="margin-top:16px">
+      <div class="ap-section-label">Indexed sections</div>
+      <div class="ap-sections" id="ap-sections"></div>
+    </div>
+  </div>
+  <div class="ap-footer" id="ap-footer"></div>
 </div>
 
 <header>
@@ -1297,6 +2109,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <div id="active-filter-bar">
+      <span class="af-label">🏷️ Filtre actif : <strong id="active-filter-name"></strong></span>
+      <button class="af-clear" onclick="clearActiveFilter()" title="Désactiver le filtre">✕</button>
+    </div>
     <div id="input-area">
       <div class="input-wrapper">
         <textarea id="query-input" placeholder="Ask a question…" rows="1" disabled></textarea>
@@ -1328,7 +2144,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <span>Themes</span>
           <span id="themes-count" style="font-family:'DM Mono',monospace;font-size:0.7rem;color:var(--text3)"></span>
         </div>
-        <div id="themes-list" style="display:flex;flex-direction:column;gap:4px;margin-top:4px;max-height:160px;overflow-y:auto;">
+        <div id="themes-list" style="display:flex;flex-direction:column;gap:3px;margin-top:4px;max-height:220px;overflow-y:auto;">
           <div style="color:var(--text3);font-size:0.75rem;font-style:italic">Loading...</div>
         </div>
       </div>
@@ -1349,11 +2165,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <button onclick="openCheckArticlesModal()" title="Choose which articles to blacklist before indexing" style="background:var(--bg3);color:var(--text2);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font-size:0.78rem;cursor:pointer;font-family:'Figtree',sans-serif;white-space:nowrap" onmouseover="this.style.borderColor='var(--accent2)';this.style.color='var(--accent2)'" onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text2)'">☑ Check</button>
         </div>
       </div>
+      <div id="ocr-badge" style="display:none;background:#1a2510;border:1px solid #3fb950;border-radius:8px;padding:10px 12px;margin-bottom:6px;">
+        <div style="font-size:0.75rem;color:#3fb950;font-weight:600;margin-bottom:6px" id="ocr-badge-label">🔍 0 PDFs image non indexés</div>
+        <div id="ocr-badge-preview" style="font-size:0.68rem;color:var(--text3);font-family:'DM Mono',monospace;margin-bottom:8px;line-height:1.5"></div>
+        <button onclick="openOCRPanel()" style="width:100%;background:#238636;color:#fff;border:none;padding:6px 10px;border-radius:6px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif">🔎 OCR & indexer</button>
+      </div>
+      <!-- v1.5 HyDE toggle -->
+      <div id="hyde-badge" onclick="toggleHyDE()" title="HyDE: generate a hypothetical passage to improve retrieval accuracy (+1-2s latency)">
+        <div class="hyde-dot"></div>
+        <span id="hyde-label">🔬 HyDE OFF</span>
+      </div>
+
       <button class="action-btn" onclick="openIngestPanel()">🔄 Index library</button>
-      <button class="action-btn" onclick="openThemePanel()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Thématisation</button>
-      <button class="action-btn danger" onclick="clearChat()">🗑 Clear conversation</button>
+      <button class="action-btn" onclick="openThemeWorkflow()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Organiser la bibliothèque</button>
+      <button class="action-btn" onclick="exportConversation()">💾 Export conversation</button>
+      <button class="action-btn danger" onclick="newConversation()">➕ New conversation</button>
       <button class="action-btn" onclick="settingsOpen()" style="border-color:var(--accent3);color:var(--accent3)">⚙️ Settings</button>
       <button class="action-btn danger" onclick="quitApp()" style="margin-top:8px;border-color:#f85149;color:#f85149;font-weight:600">⏻ Quit RefChat</button>
+    </div>
+
+    <!-- v1.5 — Conversation history -->
+    <div>
+      <div class="sidebar-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>History</span>
+        <button onclick="loadHistory()" style="background:transparent;border:none;color:var(--text3);font-size:0.8rem;cursor:pointer;padding:0" title="Refresh">↺</button>
+      </div>
+      <div id="history-list" style="display:flex;flex-direction:column;gap:3px;max-height:200px;overflow-y:auto;margin-top:4px;">
+        <div style="color:var(--text3);font-size:0.72rem;font-style:italic">No saved conversations</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1376,6 +2215,7 @@ const memBadge    = document.getElementById('memory-badge');
 
 let isReady = false, isLoading = false, memoryEnabled = false;
 let currentAbortController = null;
+let ingestPoll = null;
 
 // 3 états : false=local seul | true=hybride | "only"=web seul
 let webSearchEnabled = false;
@@ -1838,6 +2678,7 @@ async function settingsOpen() {
   document.getElementById('s-num-gpu').value    = d.num_gpu    !== undefined ? d.num_gpu    : '';
   document.getElementById('s-num-batch').value  = d.num_batch  !== undefined ? d.num_batch  : '';
   document.getElementById('s-num-ctx-local').value = d.ollama_num_ctx_local !== undefined ? d.ollama_num_ctx_local : '';
+  document.getElementById('s-bm25-weight').value   = d.bm25_weight !== undefined ? d.bm25_weight : 0.3;
   document.getElementById('settings-modal').classList.add('open');
   settingsRefreshModels();
 }
@@ -1855,11 +2696,13 @@ async function settingsSave() {
   const numGpu    = document.getElementById('s-num-gpu').value.trim();
   const numBatch  = document.getElementById('s-num-batch').value.trim();
   const numCtxLocal = document.getElementById('s-num-ctx-local').value.trim();
+  const bm25Weight  = document.getElementById('s-bm25-weight').value.trim();
   const hwPayload = {};
   if (numThread) hwPayload.num_thread = parseInt(numThread);
   if (numGpu !== '') hwPayload.num_gpu = parseInt(numGpu);
   if (numBatch) hwPayload.num_batch = parseInt(numBatch);
   if (numCtxLocal) hwPayload.ollama_num_ctx_local = parseInt(numCtxLocal);
+  if (bm25Weight !== '') hwPayload.bm25_weight = parseFloat(bm25Weight);
   const r = await fetch('/api/config', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ zotero_path: zotero, mistral_api_key: apikey,
@@ -1876,6 +2719,39 @@ async function settingsStartIngest() {
   await settingsSave();
   settingsClose();
   openIngestPanel();
+}
+
+// ══ AUDIT: fix missing abstracts ══════════════════════════════════════════════
+
+async function auditFixAbstracts() {
+  const btn = document.getElementById('s-btn-audit');
+  const logBox = document.getElementById('audit-log-box');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+  logBox.style.display = 'block';
+  logBox.textContent = 'Starting audit…\n';
+
+  const r = await fetch('/api/audit/fix-abstracts', { method: 'POST' });
+  const j = await r.json();
+  if (!j.success) {
+    logBox.textContent = '❌ ' + (j.error || 'Error');
+    btn.disabled = false;
+    btn.textContent = '🔧 Fix missing abstracts';
+    return;
+  }
+
+  // Poll status
+  const poll = setInterval(async () => {
+    const s = await (await fetch('/api/audit/status')).json();
+    logBox.textContent = (s.log || []).join('\n');
+    logBox.scrollTop = logBox.scrollHeight;
+    if (s.done) {
+      clearInterval(poll);
+      if (s.error) logBox.textContent += '\n❌ ' + s.error;
+      btn.disabled = false;
+      btn.textContent = '🔧 Fix missing abstracts';
+    }
+  }, 1000);
 }
 
 document.getElementById('settings-modal').addEventListener('click', e => {
@@ -1920,8 +2796,9 @@ async function sendQuery() {
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
           query: query,
-          web_search: webSearchEnabled
-      }), 
+          web_search: webSearchEnabled,
+          active_theme_filter: activeThemeFilter   // filtre persistant sidebar (null si inactif)
+      }),
       signal:currentAbortController.signal
     });
     
@@ -1943,6 +2820,7 @@ async function sendQuery() {
           messagesEl.scrollTop=messagesEl.scrollHeight;
         }
         if (payload.done) {
+          if (!bubbleReady) { thinkingEl.remove(); messagesEl.appendChild(botDiv); bubbleReady=true; }
           const meta=payload;
           const modeMap={question:'💬 Question',resume:'📋 Summary',reference:'🔎 References',auteur:'👤 Author'};
           let html=`<div class="mode-badge mode-${meta.mode||'question'}">${modeMap[meta.mode]||'💬 Question'}</div>`+marked.parse(fullText);
@@ -1952,9 +2830,19 @@ async function sendQuery() {
             html+=`<div class="articles-info"><div class="articles-info-title">📂 ${meta.articles.length} article(s) analyzed</div>`;
             for (const a of meta.articles) {
               const isWeb = (a.nb_chunks === 0 || (a.titre && a.titre.startsWith('🌐')));
+              const fnEnc = !isWeb && a.filename ? JSON.stringify(a.filename) : '';
+              const detailBtn = fnEnc
+                ? `<button onclick="openArticlePanel(${fnEnc})" title="Article details"
+                     style="background:transparent;border:1px solid var(--border);color:var(--text3);font-size:0.62rem;padding:1px 5px;border-radius:3px;cursor:pointer;margin-left:4px;flex-shrink:0"
+                     onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'"
+                     onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">🔍</button>`
+                : '';
               html+=`<div class="article-row" style="${isWeb ? 'border-left:2px solid var(--accent);padding-left:6px' : ''}">
                        <span>${isWeb ? '🌐 ' : ''}${escHtml(a.auteur)} (${escHtml(a.annee)}) — ${escHtml(a.titre)}</span>
-                       <span style="color:var(--text3);font-family:'DM Mono',monospace;font-size:0.72rem">${isWeb ? 'web' : a.nb_chunks+' chunks'}</span>
+                       <div style="display:flex;align-items:center;gap:2px;flex-shrink:0">
+                         <span style="color:var(--text3);font-family:'DM Mono',monospace;font-size:0.72rem">${isWeb ? 'web' : a.nb_chunks+' chunks'}</span>
+                         ${detailBtn}
+                       </div>
                      </div>`;
             }
             html+=`</div>`;
@@ -1992,11 +2880,16 @@ async function sendQuery() {
                   : '';
                 // Encodage base64 du chemin pour éviter tout conflit de guillemets dans onclick
                 const b64Path = btoa(unescape(encodeURIComponent(s.url || '')));
+                const fnDetail = s.filename ? JSON.stringify(s.filename) : '';
+                const detailBtn2 = fnDetail
+                  ? `<button onclick="event.stopPropagation();openArticlePanel(${fnDetail})" title="View article details"
+                       style="background:transparent;border:none;color:var(--accent);font-size:0.65rem;cursor:pointer;padding:0 2px;margin-left:3px;text-decoration:none;">🔍</button>`
+                  : '';
                 html+=`<span class="source-tag zotero-link" title="Open PDF"
                           onclick="openLocalPdf(atob('${b64Path}'))" style="cursor:pointer;">
                           📄 ${escHtml(s.auteur)}, ${escHtml(s.annee)}
                           <span style="font-size:0.62rem;opacity:0.6;margin-left:3px">↗ PDF</span>
-                        </span>${doiLink}`;
+                        </span>${doiLink}${detailBtn2}`;
               } else {
                 // Fallback : tag simple sans lien
                 html+=`<span class="source-tag">📄 ${escHtml(s.auteur)}, ${escHtml(s.annee)}</span>`;
@@ -2199,6 +3092,96 @@ async function scanNouveauxArticles() {
   }
 }
 
+// ══ OCR QUEUE & PANEL ══════════════════════════════════════════════════════════
+
+async function loadOCRQueue() {
+  try {
+    const r = await fetch('/api/ocr/queue');
+    const d = await r.json();
+    const badge   = document.getElementById('ocr-badge');
+    const label   = document.getElementById('ocr-badge-label');
+    const preview = document.getElementById('ocr-badge-preview');
+    if (d.count > 0) {
+      badge.style.display = 'block';
+      label.textContent = `🔍 ${d.count} PDF${d.count > 1 ? 's' : ''} image non indexé${d.count > 1 ? 's' : ''}`;
+      const names = (d.items || []).slice(0, 5).map(n => '• ' + n.replace(/\.[^.]+$/, '').substring(0, 40)).join('\n');
+      preview.textContent = names + (d.count > 5 ? `\n… +${d.count - 5} autres` : '');
+    } else {
+      badge.style.display = 'none';
+    }
+  } catch {}
+}
+
+let ocrPoll = null;
+
+function openOCRPanel() {
+  openPanelWithStreaming({
+    title: '🔍 OCR — PDFs image',
+    startUrl: '/api/ocr/start',
+    statusUrl: '/api/ocr/status',
+    startPayload: {},
+    onDone: async (data) => {
+      await loadOCRQueue();
+      if (data.stats) {
+        const s = data.stats;
+        return `✅ OCR terminé — ${s.success}/${s.total} indexé(s), ${s.failed} échec(s), ${s.skipped} ignoré(s)`;
+      }
+      return '✅ OCR terminé';
+    },
+  });
+}
+
+/**
+ * Generic helper: opens the ingest-style log panel, starts a background job
+ * and polls until done.
+ * opts: { title, startUrl, statusUrl, startPayload, onDone }
+ */
+function openPanelWithStreaming(opts) {
+  const panel   = document.getElementById('ingest-panel');
+  const titleEl = document.getElementById('ingest-panel-title');
+  const logEl   = document.getElementById('ingest-log');
+  const doneEl  = document.getElementById('ingest-done-msg');
+  if (!panel) return;
+
+  if (titleEl) titleEl.textContent = opts.title || '⏳ Processing…';
+  if (doneEl)  doneEl.style.display = 'none';
+  logEl.innerHTML = '';
+  panel.style.display = 'flex';
+
+  fetch(opts.startUrl, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(opts.startPayload || {}),
+  }).then(r => r.json()).then(async d => {
+    if (!d.success) {
+      logEl.innerHTML += `<div style="color:#f85149">❌ ${d.error || 'Erreur'}</div>`;
+      return;
+    }
+    let seen = 0;
+    if (ocrPoll) clearInterval(ocrPoll);
+    ocrPoll = setInterval(async () => {
+      try {
+        const s = await (await fetch(opts.statusUrl)).json();
+        const lines = s.log || [];
+        for (let i = seen; i < lines.length; i++) {
+          const div = document.createElement('div');
+          div.textContent = lines[i];
+          logEl.appendChild(div);
+        }
+        seen = lines.length;
+        logEl.scrollTop = logEl.scrollHeight;
+        if (!s.running) {
+          clearInterval(ocrPoll); ocrPoll = null;
+          let msg = s.error ? `❌ ${s.error}` : (opts.onDone ? await opts.onDone(s) : '✅ Done');
+          if (doneEl) { doneEl.textContent = msg; doneEl.style.display = 'block'; }
+        }
+      } catch {}
+    }, 800);
+  }).catch(e => {
+    logEl.innerHTML += `<div style="color:#f85149">❌ ${e.message}</div>`;
+  });
+}
+
 // ══ CHECK ARTICLES MODAL ══════════════════════════════════════════════════════
 
 let checkArticlesData = [];
@@ -2309,7 +3292,83 @@ document.getElementById('check-articles-modal').addEventListener('click', e => {
 });
 
 
-function openThemePanel() {
+// ═══ THÉMATISATION — WORKFLOW 2 ÉTAPES ═══════════════════════════════════════
+
+let activeThemeFilter = null;
+
+function setActiveFilter(theme) {
+  activeThemeFilter = theme;
+  const bar  = document.getElementById('active-filter-bar');
+  const name = document.getElementById('active-filter-name');
+  if (bar)  bar.style.display  = 'flex';
+  if (name) name.textContent   = theme;
+}
+function clearActiveFilter() {
+  activeThemeFilter = null;
+  const bar = document.getElementById('active-filter-bar');
+  if (bar) bar.style.display = 'none';
+}
+
+// ── Sidebar accordéon ──────────────────────────────────────────────────────
+
+async function loadThemes() {
+  const listEl  = document.getElementById('themes-list');
+  const countEl = document.getElementById('themes-count');
+  if (!listEl) return;
+  try {
+    const r = await fetch('/api/themes/articles');
+    const d = await r.json();
+    if (!d.themes || d.themes.length === 0) {
+      listEl.innerHTML = '<div style="color:var(--text3);font-size:0.75rem;font-style:italic">Aucun thème — clique sur 🏷️ Organiser la bibliothèque</div>';
+      if (countEl) countEl.textContent = '';
+      return;
+    }
+    if (countEl) countEl.textContent = d.themes.length + ' thème(s)';
+    listEl.innerHTML = d.themes.map((t, i) => {
+      const name  = t.name.length > 32 ? t.name.substring(0, 30) + '…' : t.name;
+      const artHtml = (t.articles || []).slice(0, 20).map(a => {
+        const label = a.auteur ? `${a.auteur} (${a.annee})` : a.fname.replace('.pdf','').substring(0,40);
+        return `<div class="theme-acc-art" title="${a.titre||a.fname}" onclick="setActiveFilter(${JSON.stringify(t.name)})">${label}</div>`;
+      }).join('');
+      const moreHtml = t.count > 20 ? `<div style="font-size:0.65rem;color:var(--text3);padding:2px 4px">+${t.count-20} autres…</div>` : '';
+      return `
+        <div class="theme-accordion-item" id="tacc-${i}">
+          <div class="theme-accordion-header" onclick="toggleThemeAccordion(this)" data-idx="${i}">
+            <span class="theme-acc-name" title="${t.name}">🏷 ${name}</span>
+            <span class="theme-acc-count">${t.count}</span>
+            <span class="theme-acc-chevron">▶</span>
+          </div>
+          <div class="theme-accordion-body" id="taccb-${i}">
+            ${artHtml}${moreHtml}
+            <button class="theme-acc-filter-btn" onclick="setActiveFilter(${JSON.stringify(t.name)})">🔍 Filtrer par ce thème</button>
+          </div>
+        </div>`;
+    }).join('');
+  } catch(e) {
+    if (listEl) listEl.innerHTML = '<div style="color:var(--text3);font-size:0.72rem">Erreur chargement thèmes</div>';
+  }
+}
+
+function toggleThemeAccordion(header) {
+  const idx  = header.dataset.idx;
+  const body = document.getElementById('taccb-' + idx);
+  const chev = header.querySelector('.theme-acc-chevron');
+  if (!body) return;
+  const open = body.style.display === 'block';
+  body.style.display = open ? 'none' : 'block';
+  if (chev) chev.style.transform = open ? '' : 'rotate(90deg)';
+  header.classList.toggle('active', !open);
+}
+
+function setQueryTheme(theme) {
+  queryInput.value = 'Resume les articles du theme ' + theme;
+  queryInput.focus();
+}
+
+// ── Workflow thématisation (preview → validate) ────────────────────────────
+
+function openThemeWorkflow() {
+  // Affiche le panneau de lancement avec choix nb thèmes
   const old = document.getElementById('theme-chat-panel');
   if (old) old.remove();
   const panel = document.createElement('div');
@@ -2318,102 +3377,609 @@ function openThemePanel() {
   panel.innerHTML = `
     <div class="ingest-header">
       <div class="ingest-spinner" id="theme-spinner"></div>
-      <span class="ingest-title">🏷️ Thématisation en cours…</span>
+      <span class="ingest-title">🏷️ Analyse en cours…</span>
     </div>
     <div style="background:rgba(63,185,80,0.08);border:1px solid var(--accent2);border-radius:8px;padding:10px 14px;margin-bottom:10px;font-size:0.78rem;color:var(--text);line-height:1.5">
-      💡 <strong>What does this do?</strong><br>
-      Analyses existing embeddings to automatically group your articles into themes.
-      Duration: 2–5 min. No PDF re-reading. No Docker needed.<br><br>
-      ⚠️ <strong>Recommended workflow:</strong><br>
-      1. Run a <strong>dry-run first</strong> from the command line to check results:<br>
-      <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">python refchat_theme.py --dry-run --topics 60 --show</code><br>
-      2. Edit <code style="background:var(--bg1);padding:2px 6px;border-radius:4px;font-size:0.73rem">refchat_stopwords.txt</code> to remove parasitic label words if needed.<br>
-      3. Only then launch here to write themes to the database.
+      💡 <strong>Comment ça marche ?</strong><br>
+      Analyse les embeddings existants pour grouper automatiquement les articles en thèmes (2–5 min, pas de re-lecture PDF, pas de Docker).<br>
+      Tu pourras <strong>renommer, fusionner et supprimer</strong> les thèmes avant validation.
     </div>
     <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center">
       <label style="font-size:0.75rem;color:var(--text2);font-family:'DM Mono',monospace;white-space:nowrap">Nb thèmes :</label>
-      <input type="number" id="theme-n-topics" placeholder="auto" min="2" max="50"
+      <input type="number" id="theme-n-topics" placeholder="auto" min="2" max="200"
         style="width:70px;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.8rem">
-      <span style="font-size:0.7rem;color:var(--text3)">Laisse vide = détection automatique</span>
+      <label style="font-size:0.75rem;color:var(--text2);font-family:'DM Mono',monospace;white-space:nowrap">Min articles/thème :</label>
+      <input type="number" id="theme-min-docs" value="5" min="2" max="20"
+        style="width:50px;background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:'DM Mono',monospace;font-size:0.8rem">
     </div>
-    <div class="ingest-log-box" id="theme-chat-log">Démarrage…</div>
+    <button id="theme-launch-btn" onclick="launchThemePreview()" style="background:var(--accent2);color:#0d1117;border:none;padding:8px 20px;border-radius:7px;font-size:0.82rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif;margin-bottom:10px">
+      🔍 Analyser (sans modifier la base)
+    </button>
+    <div class="ingest-log-box" id="theme-chat-log" style="height:160px">En attente…</div>
     <div class="ingest-progress"><div class="ingest-progress-bar" id="theme-chat-bar"></div></div>
     <div id="theme-done-msg" style="display:none;margin-top:10px;font-size:0.82rem;color:var(--accent2)"></div>
   `;
   messagesEl.appendChild(panel);
   messagesEl.scrollTop = messagesEl.scrollHeight;
-
-  const nTopicsInput = document.getElementById('theme-n-topics');
-  const nTopics = nTopicsInput && nTopicsInput.value ? parseInt(nTopicsInput.value) : null;
-
-  fetch('/api/theme/start', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ n_topics: nTopics, min_docs: 2 })
-  }).then(r => r.json()).then(d => {
-    if (!d.success) {
-      const logEl = document.getElementById('theme-chat-log');
-      if (logEl) logEl.textContent = 'Erreur : ' + d.error;
-      const sp = document.getElementById('theme-spinner');
-      if (sp) sp.style.display = 'none';
-      return;
-    }
-    const poll = setInterval(async () => {
-      const s = await (await fetch('/api/theme/status')).json();
-      const logEl  = document.getElementById('theme-chat-log');
-      const barEl  = document.getElementById('theme-chat-bar');
-      const doneEl = document.getElementById('theme-done-msg');
-      const title  = panel.querySelector('.ingest-title');
-      const sp     = document.getElementById('theme-spinner');
-      if (!logEl) { clearInterval(poll); return; }
-      if (s.log && s.log.length) { logEl.textContent = s.log.join('\n'); logEl.scrollTop = logEl.scrollHeight; }
-      if (s.done) {
-        clearInterval(poll);
-        if (sp) sp.style.display = 'none';
-        if (barEl) { barEl.style.animation = 'none'; barEl.style.width = '100%'; }
-        if (s.error) {
-          if (title) title.textContent = '❌ Erreur thématisation';
-          if (barEl) barEl.style.background = '#f85149';
-          showToast('❌ ' + s.error, true);
-        } else {
-          if (title) title.textContent = '✅ Thématisation terminée !';
-          if (barEl) barEl.style.background = 'var(--accent2)';
-          if (doneEl) { doneEl.style.display = 'block'; doneEl.innerHTML = '✅ Themes saved to database — sidebar updated.<br><span style="font-size:0.75rem;color:var(--text3)">💡 If results look off, edit <code>refchat_stopwords.txt</code> and re-run the dry-run before launching again.</span>'; }
-          showToast('✅ Thématisation terminée !');
-          await loadThemes();
-        }
-      }
-    }, 1500);
-  }).catch(e => {
-    const logEl = document.getElementById('theme-chat-log');
-    if (logEl) logEl.textContent = 'Erreur réseau : ' + e.message;
-  });
 }
 
-async function loadThemes() {
-  const listEl = document.getElementById('themes-list');
-  const countEl = document.getElementById('themes-count');
-  if (!listEl) return;
-  try {
-    const r = await fetch('/api/themes');
-    const d = await r.json();
-    if (!d.themes || d.themes.length === 0) {
-      listEl.innerHTML = '<div style="color:var(--text3);font-size:0.75rem;font-style:italic">Aucun thème — clique sur 🏷️ Thématisation</div>';
+async function launchThemePreview() {
+  const nTopicsEl  = document.getElementById('theme-n-topics');
+  const minDocsEl  = document.getElementById('theme-min-docs');
+  const logEl      = document.getElementById('theme-chat-log');
+  const barEl      = document.getElementById('theme-chat-bar');
+  const doneEl     = document.getElementById('theme-done-msg');
+  const title      = document.querySelector('#theme-chat-panel .ingest-title');
+  const sp         = document.getElementById('theme-spinner');
+  const launchBtn  = document.getElementById('theme-launch-btn');
+  if (launchBtn) launchBtn.disabled = true;
+  if (logEl) logEl.textContent = 'Lancement de l\'analyse BERTopic…';
+
+  const nTopics = nTopicsEl && nTopicsEl.value ? parseInt(nTopicsEl.value) : null;
+  const minDocs = minDocsEl ? (parseInt(minDocsEl.value) || 5) : 5;
+
+  const r = await fetch('/api/theme/preview', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ n_topics: nTopics, min_docs: minDocs })
+  }).then(r=>r.json()).catch(e => ({ success: false, error: e.message }));
+
+  if (!r.success) {
+    if (logEl) logEl.textContent = '❌ ' + r.error;
+    if (launchBtn) launchBtn.disabled = false;
+    return;
+  }
+
+  let prevPoll = setInterval(async () => {
+    const s = await fetch('/api/theme/preview/status').then(r=>r.json()).catch(()=>({}));
+    if (s.log && s.log.length && logEl) {
+      logEl.textContent = s.log.join('\n');
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (!s.done) return;
+    clearInterval(prevPoll);
+    if (sp) sp.style.display = 'none';
+    if (barEl) { barEl.style.animation='none'; barEl.style.width='100%'; }
+    if (s.error) {
+      if (title) title.textContent = '❌ Erreur analyse';
+      if (barEl) barEl.style.background = '#f85149';
+      if (logEl) logEl.textContent += '\n❌ ' + s.error;
+      if (launchBtn) launchBtn.disabled = false;
       return;
     }
-    countEl.textContent = d.themes.length + ' theme(s)';
-    listEl.innerHTML = d.themes.map(t => {
-      const short = t.length > 30 ? t.substring(0, 28) + '…' : t;
-      return '<button class="example-btn" style="font-size:0.72rem;padding:5px 8px;margin-bottom:3px;" onclick="setQueryTheme(' + JSON.stringify(t) + ')" title="' + t + '">🏷 ' + short + '</button>';
-    }).join('');
+    if (title) title.textContent = '✅ Analyse terminée — validation en attente';
+    if (barEl) barEl.style.background = 'var(--accent2)';
+    if (doneEl) {
+      doneEl.style.display = 'block';
+      doneEl.innerHTML = `✅ ${s.result.stats.n_themes} thèmes détectés. ` +
+        (s.result.stats.n_issues ? `⚠️ ${s.result.stats.n_issues} problème(s) qualité. ` : '') +
+        `<button onclick="showTVModal()" style="background:var(--accent2);color:#0d1117;border:none;padding:4px 14px;border-radius:6px;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif;margin-left:8px">🖊 Réviser et valider</button>`;
+    }
+  }, 1500);
+}
+
+// ── Modal de validation ────────────────────────────────────────────────────
+
+let _tvData   = null;   // preview result complet
+let _tvEdits  = {};     // {theme_name: {newName?, deleted?}}
+let _tvValidatePoll = null;
+
+async function showTVModal() {
+  // Récupère le résultat de prévisualisation
+  const s = await fetch('/api/theme/preview/status').then(r=>r.json()).catch(()=>({}));
+  if (!s.result) { showToast('❌ Aucune prévisualisation disponible', true); return; }
+  _tvData  = s.result;
+  _tvEdits = {};
+  _renderTVModal();
+  document.getElementById('theme-validate-modal').style.display = 'flex';
+}
+
+function closeTVModal() {
+  document.getElementById('theme-validate-modal').style.display = 'none';
+  if (_tvValidatePoll) { clearInterval(_tvValidatePoll); _tvValidatePoll = null; }
+}
+
+function _renderTVModal() {
+  const stats   = _tvData.stats;
+  const themes  = _tvData.themes;
+  const issues  = themes.filter(t => t.issues && t.issues.length > 0);
+  document.getElementById('tv-stats').textContent =
+    `${stats.n_articles} articles · ${stats.n_themes} thèmes · ${stats.n_unclassified} non classifiés`;
+  const issuesBar = document.getElementById('tv-issues-bar');
+  if (issues.length) {
+    issuesBar.style.display = 'block';
+    issuesBar.textContent = `⚠️ ${issues.length} thème(s) avec des problèmes qualité détectés (surlignés ci-dessous)`;
+  } else {
+    issuesBar.style.display = 'none';
+  }
+  const list = document.getElementById('tv-list');
+  list.innerHTML = themes.map(t => _renderTVCard(t)).join('');
+  _tvUpdateSelCount();
+}
+
+function _renderTVCard(t) {
+  const edit = _tvEdits[t.name] || {};
+  const deleted   = !!edit.deleted;
+  const issueCls  = t.issues && t.issues.some(i=>i.type==='parasitic') ? 'is-parasitic'
+                  : t.issues && t.issues.length ? 'has-issues' : '';
+  const issueBadges = (t.issues||[]).map(i =>
+    `<span class="tv-issue-badge ${i.type}">${i.msg}</span>`
+  ).join('');
+  const suggLine = t.suggested_rename
+    ? `<div class="tv-suggestion">💡 Suggestion : <em>${t.suggested_rename}</em>
+        <button class="tv-apply-btn" onclick="tvApplySuggestion(${JSON.stringify(t.name)}, ${JSON.stringify(t.suggested_rename)})">Appliquer</button>
+       </div>` : '';
+  const artLines = (t.articles||[]).slice(0,15).map(a => {
+    const lbl = a.auteur ? `${a.auteur} (${a.annee})` : a.fname.replace('.pdf','').substring(0,50);
+    return `<div class="tv-art-line" title="${a.titre||a.fname}">${lbl}</div>`;
+  }).join('');
+  const moreArt = t.count > 15 ? `<div class="tv-art-line" style="color:var(--text3)">+${t.count-15} autres…</div>` : '';
+  const delBtn = deleted
+    ? `<button class="tv-restore-btn" onclick="tvRestoreTheme(${JSON.stringify(t.name)})">↩ Restaurer</button>`
+    : `<button class="tv-del-btn" title="Supprimer ce thème (articles → Non classifié)" onclick="tvDeleteTheme(${JSON.stringify(t.name)})">🗑</button>`;
+  const nameVal = edit.newName !== undefined ? edit.newName : t.name;
+  return `<div class="tv-card ${issueCls} ${deleted ? 'is-deleted' : ''}" id="tvc-${CSS.escape(t.name)}" data-original="${t.name}">
+    <div class="tv-card-top">
+      <input class="tv-name-input" value="${nameVal.replace(/"/g,'&quot;')}" data-original="${t.name}"
+             oninput="_tvSetName(${JSON.stringify(t.name)}, this.value)" ${deleted ? 'disabled' : ''}>
+      <span class="tv-count-badge">${t.count} art.</span>
+      ${delBtn}
+    </div>
+    ${issueBadges ? `<div class="tv-issue-badges">${issueBadges}</div>` : ''}
+    ${suggLine}
+    <details class="tv-articles-details">
+      <summary>${t.count} article(s)</summary>
+      <div>${artLines}${moreArt}</div>
+    </details>
+  </div>`;
+}
+
+function _tvSetName(original, newName) {
+  if (!_tvEdits[original]) _tvEdits[original] = {};
+  _tvEdits[original].newName = newName;
+}
+function tvApplySuggestion(original, suggestion) {
+  if (!_tvEdits[original]) _tvEdits[original] = {};
+  _tvEdits[original].newName = suggestion;
+  const card = document.getElementById('tvc-' + CSS.escape(original));
+  if (card) {
+    const inp = card.querySelector('.tv-name-input');
+    if (inp) inp.value = suggestion;
+  }
+}
+function tvDeleteTheme(name) {
+  if (!_tvEdits[name]) _tvEdits[name] = {};
+  _tvEdits[name].deleted = true;
+  const card = document.getElementById('tvc-' + CSS.escape(name));
+  if (card) {
+    card.classList.add('is-deleted');
+    const inp = card.querySelector('.tv-name-input');
+    if (inp) inp.disabled = true;
+    const delBtn = card.querySelector('.tv-del-btn');
+    if (delBtn) delBtn.outerHTML = `<button class="tv-restore-btn" onclick="tvRestoreTheme(${JSON.stringify(name)})">↩ Restaurer</button>`;
+  }
+  _tvUpdateSelCount();
+}
+function tvRestoreTheme(name) {
+  if (_tvEdits[name]) delete _tvEdits[name].deleted;
+  const card = document.getElementById('tvc-' + CSS.escape(name));
+  if (card) {
+    card.classList.remove('is-deleted');
+    const inp = card.querySelector('.tv-name-input');
+    if (inp) inp.disabled = false;
+    const restBtn = card.querySelector('.tv-restore-btn');
+    if (restBtn) restBtn.outerHTML = `<button class="tv-del-btn" title="Supprimer" onclick="tvDeleteTheme(${JSON.stringify(name)})">🗑</button>`;
+  }
+  _tvUpdateSelCount();
+}
+function tvSelectAllWithIssues() {
+  (_tvData.themes||[]).filter(t=>t.issues&&t.issues.length).forEach(t=>tvDeleteTheme(t.name));
+}
+function tvDeleteSelected() {
+  // Supprime tous les thèmes marqués deleted (déjà marqués par tvDeleteTheme)
+  const deleted = Object.entries(_tvEdits).filter(([,v])=>v.deleted).length;
+  if (!deleted) { showToast('Aucun thème sélectionné pour suppression', true); return; }
+  showToast(`${deleted} thème(s) marqués pour suppression`);
+}
+function _tvUpdateSelCount() {
+  const n = Object.values(_tvEdits).filter(v=>v.deleted).length;
+  const el = document.getElementById('tv-sel-count');
+  if (el) el.textContent = n ? `${n} marqué(s) pour suppression` : '';
+}
+
+function _tvBuildMapping() {
+  const mapping = {};
+  for (const theme of _tvData.themes) {
+    const edit = _tvEdits[theme.name] || {};
+    if (edit.deleted) {
+      for (const art of theme.articles) mapping[art.fname] = 'Non classifie';
+      continue;
+    }
+    const newName = (edit.newName !== undefined && edit.newName.trim())
+                    ? edit.newName.trim() : theme.name;
+    for (const art of theme.articles) mapping[art.fname] = newName;
+  }
+  return mapping;
+}
+
+async function tvValidate() {
+  const mapping = _tvBuildMapping();
+  const n = Object.keys(mapping).length;
+  if (!n) { showToast('Aucun article à mettre à jour', true); return; }
+  const logEl  = document.getElementById('tv-log');
+  const progEl = document.getElementById('tv-progress');
+  if (logEl)  { logEl.style.display='block'; logEl.textContent='Envoi en cours…'; }
+  if (progEl) progEl.textContent = 'Écriture dans ChromaDB…';
+  // Désactiver le bouton valider
+  const btn = document.querySelector('.tv-btn-primary');
+  if (btn) btn.disabled = true;
+
+  const r = await fetch('/api/theme/validate', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ filename_to_theme: mapping })
+  }).then(r=>r.json()).catch(e=>({success:false,error:e.message}));
+
+  if (!r.success) {
+    if (logEl) logEl.textContent = '❌ ' + r.error;
+    if (btn) btn.disabled = false;
+    return;
+  }
+  // Poll validation status
+  _tvValidatePoll = setInterval(async () => {
+    const s = await fetch('/api/theme/validate/status').then(r=>r.json()).catch(()=>({}));
+    if (s.log && s.log.length && logEl) {
+      logEl.textContent = s.log.join('\n'); logEl.scrollTop = logEl.scrollHeight;
+    }
+    if (!s.done) return;
+    clearInterval(_tvValidatePoll); _tvValidatePoll = null;
+    if (s.error) {
+      if (logEl) logEl.textContent += '\n❌ ' + s.error;
+      if (btn) btn.disabled = false;
+      showToast('❌ Erreur validation : ' + s.error, true);
+    } else {
+      if (progEl) progEl.textContent = '✅ Thèmes écrits dans la base !';
+      showToast('✅ Thématisation validée et enregistrée !');
+      await loadThemes();   // rafraîchir sidebar
+      setTimeout(closeTVModal, 1500);
+    }
+  }, 1500);
+}
+
+// Rétro-compat : conserve openThemePanel() au cas où il serait appelé ailleurs
+function openThemePanel() { openThemeWorkflow(); }
+
+// ═══ MANAGE DB ══════════════════════════════════════════════════════════════
+let _mdbArticles = [];
+
+async function openManageDB() {
+  settingsClose();
+  const modal = document.getElementById('manage-db-modal');
+  modal.style.display = 'flex';
+  await loadManageDBArticles();
+}
+function closeManageDB() {
+  document.getElementById('manage-db-modal').style.display = 'none';
+}
+async function loadManageDBArticles() {
+  const listEl  = document.getElementById('mdb-list');
+  const countEl = document.getElementById('mdb-count');
+  listEl.innerHTML = '<div style="color:var(--text3);font-size:0.85rem;padding:20px;text-align:center">Loading…</div>';
+  try {
+    const d = await (await fetch('/api/db/articles')).json();
+    _mdbArticles = d.articles || [];
+    countEl.textContent = `${_mdbArticles.length} articles`;
+    renderManageDBList(_mdbArticles);
   } catch(e) {
-    listEl.innerHTML = '<div style="color:var(--text3);font-size:0.72rem">Error loading themes</div>';
+    listEl.innerHTML = `<div style="color:#f85149;padding:12px">Error: ${e.message}</div>`;
+  }
+}
+function renderManageDBList(articles) {
+  const listEl = document.getElementById('mdb-list');
+  if (!articles.length) {
+    listEl.innerHTML = '<div style="color:var(--text3);font-size:0.85rem;padding:20px;text-align:center">No articles found</div>';
+    mdbUpdateCount(); return;
+  }
+  listEl.innerHTML = articles.map(a => {
+    const badge   = a.doc_type === 'thesis'
+      ? '<span style="background:#2a1a3a;color:#bc8cff;font-size:0.62rem;padding:1px 6px;border-radius:4px;margin-left:4px;font-family:\'DM Mono\',monospace">THESIS</span>' : '';
+    const label   = a.auteur ? `${a.auteur}${a.annee ? ' (' + a.annee + ')' : ''}` : a.filename;
+    const subline = a.auteur ? a.filename : (a.date || '');
+    return `<label style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:6px;cursor:pointer;border:1px solid transparent;transition:background 0.12s" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background=''">
+      <input type="checkbox" data-filename="${a.filename}" onchange="mdbUpdateCount()" style="width:15px;height:15px;accent-color:var(--accent);flex-shrink:0">
+      <div style="flex:1;min-width:0">
+        <div style="font-size:0.82rem;color:var(--text);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${label}${badge}</div>
+        <div style="font-size:0.7rem;color:var(--text3);font-family:'DM Mono',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${subline}</div>
+      </div>
+      <span style="font-size:0.68rem;color:var(--text3);white-space:nowrap;font-family:'DM Mono',monospace;flex-shrink:0">${a.nb_chunks} chunks</span>
+    </label>`;
+  }).join('');
+  mdbUpdateCount();
+}
+function filterManageDB() {
+  const q = document.getElementById('mdb-search').value.toLowerCase().trim();
+  const filtered = q ? _mdbArticles.filter(a =>
+    a.filename.toLowerCase().includes(q) ||
+    (a.auteur||'').toLowerCase().includes(q) ||
+    (a.annee||'').includes(q) ||
+    (a.titre||'').toLowerCase().includes(q)
+  ) : _mdbArticles;
+  renderManageDBList(filtered);
+  document.getElementById('mdb-count').textContent = q
+    ? `${filtered.length} / ${_mdbArticles.length} articles`
+    : `${_mdbArticles.length} articles`;
+}
+function mdbUpdateCount() {
+  const checked = document.querySelectorAll('#mdb-list input[type=checkbox]:checked');
+  document.getElementById('mdb-selected-count').textContent = `${checked.length} selected`;
+  document.getElementById('mdb-btn-delete').disabled = checked.length === 0;
+}
+function mdbSelectAll()  { document.querySelectorAll('#mdb-list input[type=checkbox]').forEach(cb => cb.checked = true);  mdbUpdateCount(); }
+function mdbSelectNone() { document.querySelectorAll('#mdb-list input[type=checkbox]').forEach(cb => cb.checked = false); mdbUpdateCount(); }
+
+async function mdbDeleteSelected() {
+  const checked   = document.querySelectorAll('#mdb-list input[type=checkbox]:checked');
+  const filenames = Array.from(checked).map(cb => cb.dataset.filename);
+  if (!filenames.length) return;
+  if (!confirm(`Delete ${filenames.length} article(s) from the database and blacklist them?\nThis cannot be undone without re-indexing.`)) return;
+
+  const btn = document.getElementById('mdb-btn-delete');
+  btn.disabled = true; btn.textContent = '⏳ Deleting…';
+  try {
+    const d = await (await fetch('/api/db/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filenames})
+    })).json();
+    if (d.success || d.deleted > 0) {
+      showToast(`🗑️ ${d.deleted} article(s) deleted and blacklisted`);
+      await loadManageDBArticles();
+    } else {
+      showToast('❌ ' + (d.errors||[]).join(', '), true);
+    }
+  } catch(e) {
+    showToast('❌ Network error: ' + e.message, true);
+  } finally {
+    btn.disabled = false; btn.textContent = '🗑️ Delete from DB & blacklist';
+    mdbUpdateCount();
+  }
+}
+document.getElementById('manage-db-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('manage-db-modal')) closeManageDB();
+});
+
+// ══ v1.5 — ARTICLE DETAIL PANEL ══════════════════════════════════════════════
+
+async function openArticlePanel(filename) {
+  const panel = document.getElementById('article-panel');
+  // Reset panel
+  document.getElementById('ap-title').textContent    = 'Loading…';
+  document.getElementById('ap-meta').innerHTML       = '';
+  document.getElementById('ap-abstract').innerHTML   = '<span style="color:var(--text3);font-style:italic">Loading…</span>';
+  document.getElementById('ap-sections').innerHTML   = '';
+  document.getElementById('ap-footer').innerHTML     = '';
+  panel.classList.add('open');
+
+  try {
+    const r = await fetch('/api/article/' + encodeURIComponent(filename));
+    const d = await r.json();
+    if (d.error) { document.getElementById('ap-title').textContent = '❌ ' + d.error; return; }
+
+    document.getElementById('ap-title').textContent = d.titre || filename;
+
+    // Meta rows
+    const rows = [
+      ['Author', d.auteur || '—'],
+      ['Year',   d.annee  || '—'],
+      d.journal ? ['Journal', d.journal] : null,
+      d.doi     ? ['DOI', `<a href="https://doi.org/${escHtml(d.doi)}" target="_blank" rel="noopener">${escHtml(d.doi)}</a>`] : null,
+      d.theme   ? ['Theme', d.theme] : null,
+      ['Type',  d.doc_type === 'thesis' ? '📖 Thesis' : '📄 Article'],
+      ['Chunks', d.nb_chunks + ' indexed'],
+    ].filter(Boolean);
+
+    document.getElementById('ap-meta').innerHTML = rows.map(([lbl, val]) =>
+      `<div class="ap-meta-row"><span class="ap-meta-label">${escHtml(lbl)}</span><span class="ap-meta-val">${val}</span></div>`
+    ).join('');
+
+    // Abstract
+    document.getElementById('ap-abstract').textContent = d.abstract
+      ? d.abstract
+      : 'No abstract available.';
+
+    // Sections chips
+    document.getElementById('ap-sections').innerHTML = (d.sections || [])
+      .map(s => `<span class="ap-sec-chip">${escHtml(s)}</span>`).join('');
+
+    // Footer buttons
+    let footerHtml = '';
+    if (d.file_link) {
+      const b64 = btoa(unescape(encodeURIComponent(d.source || '')));
+      footerHtml += `<button class="ap-btn primary" onclick="openLocalPdf(atob('${b64}'))">↗ Open PDF</button>`;
+    }
+    if (d.doi) {
+      footerHtml += `<a class="ap-btn" href="https://doi.org/${escHtml(d.doi)}" target="_blank" rel="noopener" style="text-decoration:none;display:flex;align-items:center;justify-content:center">🔗 DOI</a>`;
+    }
+    footerHtml += `<button class="ap-btn" onclick="closeArticlePanel()">Close</button>`;
+    document.getElementById('ap-footer').innerHTML = footerHtml;
+
+  } catch(e) {
+    document.getElementById('ap-title').textContent = '❌ Error: ' + e.message;
   }
 }
 
-function setQueryTheme(theme) {
-  queryInput.value = 'Resume les articles du theme ' + theme;
-  queryInput.focus();
+function closeArticlePanel() {
+  document.getElementById('article-panel').classList.remove('open');
+}
+
+// Close panel on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeArticlePanel();
+});
+
+// ══ v1.5 — EXPORT CONVERSATION ════════════════════════════════════════════════
+
+function exportConversation() {
+  const msgs = document.querySelectorAll('.message');
+  if (!msgs.length) { showToast('⚠️ No conversation to export', true); return; }
+
+  let md = `# RefChat — Conversation Export\n\n_${new Date().toLocaleDateString('en-GB', {year:'numeric',month:'long',day:'numeric'})}_\n\n---\n\n`;
+
+  for (const msg of msgs) {
+    if (msg.classList.contains('user')) {
+      const text = msg.querySelector('.bubble')?.textContent?.trim() || '';
+      md += `## 🧑 Question\n\n${text}\n\n`;
+    } else if (msg.classList.contains('bot')) {
+      const raw = msg.querySelector('.bubble')?._rawText || msg.querySelector('.bubble')?.textContent?.trim() || '';
+      md += `## 🤖 Answer\n\n${raw}\n\n`;
+      // Sources
+      const tags = msg.querySelectorAll('.source-tag');
+      if (tags.length) {
+        md += `**Sources:** `;
+        md += Array.from(tags).map(t => t.textContent.trim()).join(' · ');
+        md += '\n\n';
+      }
+      md += '---\n\n';
+    }
+  }
+
+  // Download as .md file
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  a.download = `refchat-${new Date().toISOString().slice(0,10)}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('✅ Conversation exported as Markdown');
+}
+
+// ══ v1.5 — HyDE TOGGLE ════════════════════════════════════════════════════════
+
+let hydeEnabled = false;
+
+async function toggleHyDE() {
+  const r = await fetch('/api/hyde/toggle', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ enabled: !hydeEnabled })
+  });
+  const d = await r.json();
+  hydeEnabled = d.hyde_enabled;
+  const badge = document.getElementById('hyde-badge');
+  const label = document.getElementById('hyde-label');
+  const dot   = badge.querySelector('.hyde-dot');
+  if (hydeEnabled) {
+    badge.classList.add('active');
+    dot.style.background = '#bc8cff';
+    dot.style.boxShadow  = '0 0 6px #bc8cff';
+    label.textContent = '🔬 HyDE ON';
+    sysMsg('— HyDE enabled: a hypothetical passage will be generated to improve retrieval (+1-2s latency) —');
+  } else {
+    badge.classList.remove('active');
+    dot.style.background = 'var(--text3)';
+    dot.style.boxShadow  = 'none';
+    label.textContent = '🔬 HyDE OFF';
+    sysMsg('— HyDE disabled: standard query enrichment —');
+  }
+}
+
+// ══ v1.5 — CONVERSATION HISTORY ══════════════════════════════════════════════
+
+let _histSessions = [];
+
+async function loadHistory() {
+  try {
+    const d = await (await fetch('/api/conversations')).json();
+    _histSessions = d.sessions || [];
+    renderHistory();
+  } catch(e) {
+    // silently fail — history is non-critical
+  }
+}
+
+function renderHistory() {
+  const el = document.getElementById('history-list');
+  if (!_histSessions.length) {
+    el.innerHTML = '<div style="color:var(--text3);font-size:0.72rem;font-style:italic">No saved conversations</div>';
+    return;
+  }
+  el.innerHTML = _histSessions.map(s =>
+    `<div class="hist-item" id="hist-${CSS.escape(s.id)}" onclick="loadHistorySession(${JSON.stringify(s.id)})">
+       <div class="hist-item-body">
+         <div class="hist-title">${escHtml(s.title || 'Unnamed')}</div>
+         <div class="hist-date">${escHtml(s.date || '')} · ${s.n || 0} Q</div>
+       </div>
+       <button class="hist-del" title="Delete" onclick="event.stopPropagation();deleteHistorySession(${JSON.stringify(s.id)})">✕</button>
+     </div>`
+  ).join('');
+}
+
+async function loadHistorySession(id) {
+  try {
+    const d = await (await fetch('/api/conversations/' + encodeURIComponent(id))).json();
+    if (d.error) { showToast('❌ ' + d.error, true); return; }
+
+    // Restore messages in the UI
+    messagesEl.querySelectorAll('.message,.thinking,.ingest-panel,div[style*="text-align:center"]').forEach(m=>m.remove());
+    if (welcomeEl) welcomeEl.style.display = 'none';
+
+    for (const msg of (d.messages || [])) {
+      if (msg.role === 'user') {
+        // Append user bubble
+        const div = document.createElement('div');
+        div.className = 'message user';
+        div.innerHTML = `<div class="avatar user-av">👤</div><div class="bubble">${escHtml(msg.content || '')}</div>`;
+        messagesEl.appendChild(div);
+      } else if (msg.role === 'assistant') {
+        // Append bot bubble with rendered markdown
+        const modeMap={question:['question','💬 Question'],resume:['resume','📋 Summary'],reference:['reference','🔎 References'],auteur:['auteur','👤 Author']};
+        const [mc, ml] = modeMap[msg.mode||'question'] || ['question','💬 Question'];
+        const div = document.createElement('div');
+        div.className = 'message bot';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.innerHTML = `<div class="mode-badge mode-${mc}">${ml}</div>` + marked.parse(msg.content || '');
+        bubble._rawText = msg.content || '';
+        div.innerHTML = `<div class="avatar bot-av">🤖</div>`;
+        div.appendChild(bubble);
+        if (msg.elapsed) {
+          const elapsed = document.createElement('div');
+          elapsed.className = 'elapsed-time';
+          elapsed.innerHTML = `<div class="elapsed-right"><span>⏱️ ${msg.elapsed}s</span></div>`;
+          bubble.appendChild(elapsed);
+        }
+        messagesEl.appendChild(div);
+      }
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    // Highlight active session
+    document.querySelectorAll('.hist-item').forEach(el => el.classList.remove('active'));
+    const activeEl = document.getElementById('hist-' + CSS.escape(id));
+    if (activeEl) activeEl.classList.add('active');
+
+    sysMsg('— Loaded conversation: ' + (d.title || id).slice(0, 60) + ' —');
+    showToast('✅ Conversation loaded');
+  } catch(e) {
+    showToast('❌ ' + e.message, true);
+  }
+}
+
+async function deleteHistorySession(id) {
+  if (!confirm('Delete this conversation?')) return;
+  try {
+    await fetch('/api/conversations/' + encodeURIComponent(id), { method: 'DELETE' });
+    _histSessions = _histSessions.filter(s => s.id !== id);
+    renderHistory();
+    showToast('🗑️ Conversation deleted');
+  } catch(e) {
+    showToast('❌ ' + e.message, true);
+  }
+}
+
+async function newConversation() {
+  clearChat();
+  await fetch('/api/conversations/new', { method: 'POST' });
+  await fetch('/api/clear_history', { method: 'POST' });
+  conversation_history_count = 0;
+  document.querySelectorAll('.hist-item').forEach(el => el.classList.remove('active'));
+  showToast('✅ New conversation started');
 }
 
 window.addEventListener('load', async () => {
@@ -2436,8 +4002,14 @@ window.addEventListener('load', async () => {
 
   refreshModelSelect();
   scanNouveauxArticles();
+  loadThemes();      // charge l'accordéon thèmes dès le démarrage
+  loadOCRQueue();    // badge PDFs image non indexés
+  loadHistory();     // v1.5 — conversation history sidebar
   // Re-scan every 60s to detect new Zotero articles without needing a page reload
   setInterval(scanNouveauxArticles, 60000);
+  setInterval(loadThemes,   120000);    // rafraîchit les thèmes toutes les 2 min
+  setInterval(loadOCRQueue, 120000);    // rafraîchit la queue OCR toutes les 2 min
+  setInterval(loadHistory,  30000);     // v1.5 — rafraîchit l'historique toutes les 30s
 
   try {
     const r=await fetch('/api/status'); const d=await r.json();
