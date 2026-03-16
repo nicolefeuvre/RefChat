@@ -247,6 +247,7 @@ def recuperer_articles_par_theme(db, theme, max_articles=6, max_chunks_par_artic
 
 
 def detecter_theme_query(query, themes_disponibles):
+    """Détection par mots-clés (rapide, utilisé comme fallback)."""
     if not themes_disponibles:
         return None
     import re
@@ -263,6 +264,48 @@ def detecter_theme_query(query, themes_disponibles):
         first_word = t.split(" - ")[0].lower()
         if len(first_word) > 4 and first_word in q_lower:
             return t
+    return None
+
+
+def detecter_theme_semantique(query: str, themes_disponibles: list, emb_fn,
+                               threshold: float = 0.52) -> str | None:
+    """
+    Détection sémantique du thème par similarité cosine entre la requête
+    et les noms de thèmes (embedding).
+
+    Args:
+        query:              question de l'utilisateur
+        themes_disponibles: liste de noms de thèmes
+        emb_fn:             fonction d'embedding (ex. STATE["db"].embedding_function)
+        threshold:          score minimum pour déclencher le filtre (défaut 0.52)
+
+    Returns:
+        Nom du thème le plus proche si score >= threshold, sinon None.
+    """
+    if not themes_disponibles or emb_fn is None:
+        return None
+    try:
+        import numpy as np
+        # Préfixe E5 si modèle E5
+        use_e5 = "e5" in EMBEDDING_MODEL.lower()
+        q_text = f"query: {query}" if use_e5 else query
+        t_texts = [f"passage: {t}" if use_e5 else t for t in themes_disponibles]
+
+        q_emb  = np.array(emb_fn.embed_query(q_text), dtype=np.float32)
+        t_embs = np.array(emb_fn.embed_documents(t_texts), dtype=np.float32)
+
+        # Cosine similarity vectorisée
+        q_norm = np.linalg.norm(q_emb) + 1e-9
+        t_norm = np.linalg.norm(t_embs, axis=1) + 1e-9
+        scores = (t_embs @ q_emb) / (t_norm * q_norm)
+
+        best_idx   = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
+
+        if best_score >= threshold:
+            return themes_disponibles[best_idx]
+    except Exception:
+        pass
     return None
 
 MAX_CHUNKS_THESIS = 5   # plafond chunks pour thèses (vs max_chunks_par_article pour articles)
