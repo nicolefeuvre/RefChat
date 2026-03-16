@@ -663,6 +663,10 @@ def run_ocr_ingest(pdf_path: str, db, log_cb=None) -> dict:
             log_cb(f"  ⛔ {msg}")
         return {"success": False, "filename": filename, "n_chunks": 0, "error": msg}
 
+    # ── v1.5: tag each chunk with its sequence number (windowed retrieval) ──
+    for _seq, _doc in enumerate(chunks):
+        _doc.metadata["chunk_seq"] = _seq
+
     # ── Index into ChromaDB ───────────────────────────────────────────────────
     try:
         for i in range(0, len(chunks), BATCH_SIZE):
@@ -952,6 +956,10 @@ def main():
             chunks, is_fallback, grobid_status = create_article_chunks(
                 pdf_path, raw_text, metadata_base, splitter
             )
+
+            # ── v1.5: tag each chunk with its sequence number (windowed retrieval) ──
+            for _seq, _doc in enumerate(chunks):
+                _doc.metadata["chunk_seq"] = _seq
 
             if is_fallback:
                 with open(LOG_FILE, "a", encoding="utf-8") as f:

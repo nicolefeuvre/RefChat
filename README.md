@@ -5,8 +5,13 @@ RefChat is a self-hosted, web-based **Retrieval-Augmented Generation (RAG)** app
 **Key features:**
 - 🧠 **Smart indexing** — uses [GROBID](https://github.com/kermitt2/grobid) (via Docker) to split PDFs by section (Abstract, Introduction, Methods, Results, etc.)
 - 🔍 **Three-stage retrieval** — E5 dense embeddings + BM25 keyword search (Reciprocal Rank Fusion) + cross-encoder reranking for maximum precision
+- 🔬 **HyDE retrieval** *(v1.5)* — optional Hypothetical Document Embeddings: the LLM generates a hypothetical scientific passage to dramatically improve retrieval precision (+10–20%)
+- 📐 **Windowed retrieval** *(v1.5)* — chunks indexed with a sequence number; neighboring chunks are automatically included to avoid truncated context
 - 🏷️ **Automatic thematization** — clusters your library into themes using BERTopic; each theme gets a semantic label and is used to silently filter RAG results
 - 🔎 **OCR pipeline** — detects image-based PDFs (scans), queues them, and re-indexes them with EasyOCR (GPU-accelerated)
+- 📄 **Article detail panel** *(v1.5)* — click the 🔍 button next to any cited article to see its full abstract, metadata, DOI link, and indexed sections in a slide-in panel
+- 💾 **Conversation persistence** *(v1.5)* — conversations are auto-saved to disk and listed in the sidebar; reload any past session with one click
+- 📤 **Export conversation** *(v1.5)* — download the current chat as a clean Markdown file (sources included)
 - 📖 **Thesis detection** — automatically classifies long documents as theses/dissertations and limits their context footprint
 - 💬 **Multi-mode chat** — question answering, thematic synthesis, reference lookup, author search
 - 🌐 **Web search integration** — optional [Semantic Scholar](https://api.semanticscholar.org/) API
@@ -14,6 +19,51 @@ RefChat is a self-hosted, web-based **Retrieval-Augmented Generation (RAG)** app
 - 🗃️ **Persistent memory** — optional conversation history across turns
 - 🛠️ **Audit tool** — CLI tool to fix missing abstracts or corrupted metadata
 - 🔁 **Incremental indexing** — re-run safely; already-processed files are skipped
+
+---
+
+## What's new in v1.5
+
+### HyDE — Hypothetical Document Embeddings
+
+Instead of embedding the raw user query, RefChat can ask the LLM to generate a short 2–3 sentence scientific passage that would hypothetically answer the question. This passage is then embedded and used for the vector search — its embedding is typically much closer to real document chunks than the raw query.
+
+**Toggle:** click the **🔬 HyDE OFF** button in the sidebar to activate. When enabled it adds ~1–2 s of latency (one extra LLM call). Recommended for precision-critical questions in large libraries.
+
+---
+
+### Windowed retrieval
+
+New articles (indexed with v1.5+) receive a `chunk_seq` integer in their metadata. During retrieval, RefChat automatically expands each selected chunk to include its immediately preceding and following chunks from the same article — preventing the common problem of relevant passages being split at a chunk boundary.
+
+> **Note:** existing articles in your database are not affected. Re-index an article to benefit from windowed retrieval.
+
+---
+
+### Article detail panel
+
+Click the **🔍** button next to any article name or cited source tag to open a slide-in panel showing:
+
+- Full title, authors, year, journal
+- DOI with a clickable link
+- Assigned theme (if thematization has been run)
+- Full abstract text
+- List of all indexed sections (Abstract, Introduction, Results…)
+- **Open PDF** button (opens the file via the local server)
+
+---
+
+### Conversation persistence
+
+Every conversation is automatically saved to disk in `personal_data/refchat_conversations/` as a JSON file after each message. The **History** section at the bottom of the sidebar lists all past sessions (most recent first). Click any entry to restore the full conversation; click ✕ to delete it permanently.
+
+**New conversation:** the **➕ New conversation** button in the sidebar clears the current chat and resets the session (memory is also cleared).
+
+---
+
+### Export conversation
+
+The **💾 Export conversation** button (sidebar) downloads the current chat as a Markdown file (`refchat-YYYY-MM-DD.md`) containing all questions, answers, and cited sources. The Markdown file can be opened in any editor or converted to PDF via a browser print.
 
 ---
 

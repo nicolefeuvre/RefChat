@@ -31,6 +31,7 @@ from refchat_llm import (
     extraire_mots_cles_llm,
     lister_themes, recuperer_articles_par_theme,
     detecter_theme_query, detecter_theme_semantique,
+    hyde_generate, get_article_details,
 )
 import refchat_config as cfg
 
@@ -38,6 +39,11 @@ app = Flask(__name__)
 
 MAX_HISTORY          = 3
 conversation_history = []
+CONVERSATIONS_DIR    = cfg.PERSONAL_DATA / "refchat_conversations"
+
+# ── v1.5 feature flags ──────────────────────────────────────────────────────
+# HyDE is OFF by default — adds ~1-2s latency but improves retrieval quality.
+HYDE_ENABLED         = False
 
 STATE = {
     "db": None, "llm": None, "nom_llm": None,
@@ -76,6 +82,9 @@ STATE = {
     "ocr_done":    False,
     "ocr_error":   None,
     "ocr_stats":   None,   # {"total": N, "success": N, "failed": N, "skipped": N}
+    # v1.5 — conversation session tracking (used by auto-save)
+    "current_session_id":   None,   # str timestamp used as filename key
+    "current_session_msgs": [],     # [{role, content, sources, mode, elapsed}]
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -990,6 +999,115 @@ def api_quit():
     return jsonify({"ok": True})
 
 
+# ── v1.5 — Conversation persistence helpers ───────────────────────────────────
+
+def _autosave_session():
+    """Write current session messages to disk (called in a background thread)."""
+    try:
+        sid  = STATE.get("current_session_id")
+        msgs = STATE.get("current_session_msgs", [])
+        if not sid or not msgs:
+            return
+        CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        path = CONVERSATIONS_DIR / f"{sid}.json"
+        # Build a readable title from the first user message
+        first_user = next((m["content"] for m in msgs if m["role"] == "user"), "")
+        title = first_user[:80].strip().replace("\n", " ")
+        data = {
+            "id":       sid,
+            "title":    title,
+            "date":     sid.replace("_", " ").replace("-", "/", 2),
+            "messages": msgs,
+        }
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  Autosave session failed: {e}")
+
+
+# ── v1.5 — API: Conversations ─────────────────────────────────────────────────
+
+@app.route("/api/conversations")
+def api_conversations_list():
+    """Return the list of saved conversation sessions (most recent first)."""
+    try:
+        CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        sessions = []
+        for p in sorted(CONVERSATIONS_DIR.glob("*.json"), reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                sessions.append({
+                    "id":    data.get("id", p.stem),
+                    "title": data.get("title", p.stem),
+                    "date":  data.get("date", ""),
+                    "n":     len([m for m in data.get("messages", []) if m["role"] == "user"]),
+                })
+            except Exception:
+                pass
+        return jsonify({"sessions": sessions})
+    except Exception as e:
+        return jsonify({"sessions": [], "error": str(e)})
+
+
+@app.route("/api/conversations/<session_id>")
+def api_conversation_load(session_id):
+    """Load a saved conversation session by ID."""
+    # Sanitize to prevent path traversal
+    safe_id = pathlib.Path(session_id).name
+    path = CONVERSATIONS_DIR / f"{safe_id}.json"
+    if not path.exists():
+        return jsonify({"error": "Session not found"}), 404
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/conversations/<session_id>", methods=["DELETE"])
+def api_conversation_delete(session_id):
+    """Delete a saved conversation session by ID."""
+    safe_id = pathlib.Path(session_id).name
+    path = CONVERSATIONS_DIR / f"{safe_id}.json"
+    if path.exists():
+        path.unlink()
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Not found"}), 404
+
+
+@app.route("/api/conversations/new", methods=["POST"])
+def api_conversation_new():
+    """Start a new conversation session (clears current session state)."""
+    global conversation_history
+    conversation_history = []
+    STATE["current_session_id"]   = None
+    STATE["current_session_msgs"] = []
+    return jsonify({"success": True})
+
+
+# ── v1.5 — API: Article detail ────────────────────────────────────────────────
+
+@app.route("/api/article/<path:filename>")
+def api_article_detail(filename):
+    """Return full metadata + abstract for a given article filename."""
+    db = STATE["db"]
+    if not db:
+        return jsonify({"error": "Database not loaded"}), 503
+    result = get_article_details(db, filename)
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result)
+
+
+# ── v1.5 — API: HyDE toggle ──────────────────────────────────────────────────
+
+@app.route("/api/hyde/toggle", methods=["POST"])
+def api_hyde_toggle():
+    global HYDE_ENABLED
+    data = request.get_json() or {}
+    HYDE_ENABLED = bool(data.get("enabled", not HYDE_ENABLED))
+    return jsonify({"hyde_enabled": HYDE_ENABLED})
+
+
 @app.route("/api/open-pdf", methods=["POST"])
 def api_open_pdf():
     """Ouvre un PDF local via le serveur (contourne la restriction Firefox file://)."""
@@ -1087,6 +1205,14 @@ def api_chat():
                         prompt_actif   = build_prompt_with_history(prompt_base, history_to_send)
                         query_enrichie = expand_query(query)
 
+                        # ── v1.5 HyDE: replace query embedding with hypothetical passage ──
+                        if HYDE_ENABLED and mode == "question":
+                            hyde_text = hyde_generate(query, llm)
+                            if hyde_text != query:
+                                from refchat_config import EMBEDDING_MODEL as _EM
+                                prefix = "passage: " if "e5" in _EM.lower() else ""
+                                query_enrichie = prefix + hyde_text
+
                         if web_search_requested == "only":
                             query_ss = extraire_mots_cles_llm(query, llm)
                             docs_web, nb_web_total_local = chercher_semantic_scholar(query_ss, limit=10)
@@ -1166,6 +1292,25 @@ def api_chat():
                 if len(conversation_history) > MAX_HISTORY * 2:
                     conversation_history = conversation_history[-(MAX_HISTORY*2):]
 
+            # ── v1.5: accumulate session messages for persistence ──
+            if STATE["current_session_id"] is None:
+                import datetime as _dt
+                STATE["current_session_id"] = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                STATE["current_session_msgs"] = []
+            STATE["current_session_msgs"].append({"role": "user",      "content": query})
+            STATE["current_session_msgs"].append({
+                "role":    "assistant",
+                "content": full_response,
+                "mode":    mode,
+                "elapsed": round(time.time() - t_start, 1),
+            })
+            # Auto-save to disk (fire-and-forget)
+            try:
+                import threading as _th
+                _th.Thread(target=_autosave_session, daemon=True).start()
+            except Exception:
+                pass
+
             seen = set()
             for doc in docs:
                 m   = doc.metadata
@@ -1189,11 +1334,13 @@ def api_chat():
                         "url":        pdf_path,
                         "doi":        m.get("doi", ""),
                         "zotero_link": file_link,
+                        "filename":   m.get("filename", ""),   # v1.5: for article detail panel
                     })
 
             articles_out = [{"auteur": a.get("auteur","?"), "annee": a.get("annee","?"),
                              "titre": (a.get("titre") or a.get("filename","?"))[:80],
-                             "nb_chunks": a.get("nb_chunks",0), "score": a.get("score",0)}
+                             "nb_chunks": a.get("nb_chunks",0), "score": a.get("score",0),
+                             "filename": a.get("filename", "")}  # v1.5: for article detail panel
                             for a in articles_info]
 
             chars_history = sum(len(m["content"]) for m in history_to_send)
@@ -1460,6 +1607,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .toast { position:fixed; bottom:24px; right:24px; padding:12px 20px; border-radius:8px; font-size:0.84rem; z-index:999; font-family:'Figtree',sans-serif; box-shadow:0 4px 20px rgba(0,0,0,0.4); pointer-events:none; }
   .toast.ok  { background:#1a3a2a; border:1px solid #3fb95066; color:var(--accent2); }
   .toast.err { background:#2d1515; border:1px solid #f8514966; color:#f85149; }
+
+  /* ═══ v1.5 — ARTICLE DETAIL PANEL ═══════════════════════════════════════ */
+  #article-panel { position:fixed; right:0; top:0; bottom:0; width:420px; max-width:95vw; background:var(--bg2); border-left:1px solid var(--border); z-index:500; display:flex; flex-direction:column; transform:translateX(100%); transition:transform 0.3s ease; box-shadow:-8px 0 32px rgba(0,0,0,0.5); }
+  #article-panel.open { transform:translateX(0); }
+  .ap-header { display:flex; align-items:flex-start; justify-content:space-between; padding:18px 20px 12px; border-bottom:1px solid var(--border); flex-shrink:0; gap:10px; }
+  .ap-title  { font-family:'DM Serif Display',serif; font-size:1.05rem; color:var(--text); line-height:1.35; flex:1; }
+  .ap-close  { background:transparent; border:none; color:var(--text3); font-size:1.1rem; cursor:pointer; flex-shrink:0; padding:2px 6px; border-radius:4px; }
+  .ap-close:hover { color:var(--text); background:var(--bg3); }
+  .ap-meta   { padding:12px 20px; border-bottom:1px solid var(--border); flex-shrink:0; display:flex; flex-direction:column; gap:5px; }
+  .ap-meta-row { display:flex; justify-content:space-between; font-size:0.78rem; }
+  .ap-meta-label { color:var(--text3); font-family:'DM Mono',monospace; }
+  .ap-meta-val   { color:var(--text2); font-weight:500; text-align:right; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ap-meta-val a { color:var(--accent); text-decoration:none; }
+  .ap-meta-val a:hover { text-decoration:underline; }
+  .ap-body   { flex:1; overflow-y:auto; padding:14px 20px; }
+  .ap-section-label { font-size:0.68rem; color:var(--text3); font-family:'DM Mono',monospace; text-transform:uppercase; letter-spacing:0.7px; margin-bottom:6px; }
+  .ap-abstract { font-size:0.85rem; color:var(--text2); line-height:1.65; }
+  .ap-sections { display:flex; flex-wrap:wrap; gap:4px; margin-top:12px; }
+  .ap-sec-chip { background:var(--bg3); border:1px solid var(--border); color:var(--text3); font-size:0.65rem; padding:2px 8px; border-radius:10px; font-family:'DM Mono',monospace; }
+  .ap-footer { padding:12px 20px; border-top:1px solid var(--border); flex-shrink:0; display:flex; gap:8px; }
+  .ap-btn { flex:1; padding:7px 12px; border-radius:7px; font-size:0.78rem; cursor:pointer; font-family:'Figtree',sans-serif; border:1px solid var(--border); background:transparent; color:var(--text2); text-align:center; }
+  .ap-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .ap-btn.primary { background:var(--accent); color:#0d1117; border:none; font-weight:600; }
+  .ap-btn.primary:hover { opacity:0.85; }
+  .source-tag.detail-link { cursor:pointer; }
+  .source-tag.detail-link:hover { border-color:var(--accent); color:var(--accent); background:#1f3a5f22; }
+
+  /* ═══ v1.5 — HISTORY SIDEBAR ════════════════════════════════════════════ */
+  .hist-item { display:flex; align-items:flex-start; gap:8px; padding:6px 8px; border-radius:6px; cursor:pointer; border:1px solid transparent; transition:background 0.12s; }
+  .hist-item:hover { background:var(--bg3); border-color:var(--border); }
+  .hist-item.active { background:#0d1f17; border-color:var(--accent2); }
+  .hist-item-body { flex:1; min-width:0; }
+  .hist-title { font-size:0.73rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .hist-date  { font-size:0.64rem; color:var(--text3); font-family:'DM Mono',monospace; margin-top:1px; }
+  .hist-del   { background:transparent; border:none; color:var(--text3); font-size:0.8rem; cursor:pointer; padding:2px 4px; border-radius:3px; flex-shrink:0; opacity:0; }
+  .hist-item:hover .hist-del { opacity:1; }
+  .hist-del:hover { color:#f85149; }
+
+  /* ═══ v1.5 — HyDE badge ═════════════════════════════════════════════════ */
+  #hyde-badge { display:inline-flex; align-items:center; gap:5px; background:var(--bg3); border:1px solid var(--border); color:var(--text3); font-size:0.72rem; padding:6px 10px; border-radius:8px; font-family:'DM Mono',monospace; cursor:pointer; margin-bottom:6px; width:100%; justify-content:center; transition:all 0.3s; }
+  #hyde-badge.active { border-color:#bc8cff44; color:#bc8cff; background:#2a1a3a; }
+  #hyde-badge .hyde-dot { width:8px; height:8px; border-radius:50%; background:var(--text3); transition:all 0.3s; }
+  #hyde-badge.active .hyde-dot { background:#bc8cff; box-shadow:0 0 6px #bc8cff; }
 </style>
 </head>
 <body>
@@ -1866,6 +2056,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ═══ v1.5 — ARTICLE DETAIL PANEL ════════════════════════════════════════ -->
+<div id="article-panel">
+  <div class="ap-header">
+    <div class="ap-title" id="ap-title">Article</div>
+    <button class="ap-close" onclick="closeArticlePanel()">✕</button>
+  </div>
+  <div class="ap-meta" id="ap-meta"></div>
+  <div class="ap-body" id="ap-body">
+    <div class="ap-section-label">Abstract</div>
+    <div class="ap-abstract" id="ap-abstract"><span style="color:var(--text3);font-style:italic">Loading…</span></div>
+    <div style="margin-top:16px">
+      <div class="ap-section-label">Indexed sections</div>
+      <div class="ap-sections" id="ap-sections"></div>
+    </div>
+  </div>
+  <div class="ap-footer" id="ap-footer"></div>
+</div>
+
 <header>
   <div class="header-left">
     <div class="logo">RefChat <span>/ Document RAG</span></div>
@@ -1962,11 +2170,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="ocr-badge-preview" style="font-size:0.68rem;color:var(--text3);font-family:'DM Mono',monospace;margin-bottom:8px;line-height:1.5"></div>
         <button onclick="openOCRPanel()" style="width:100%;background:#238636;color:#fff;border:none;padding:6px 10px;border-radius:6px;font-size:0.78rem;font-weight:600;cursor:pointer;font-family:'Figtree',sans-serif">🔎 OCR & indexer</button>
       </div>
+      <!-- v1.5 HyDE toggle -->
+      <div id="hyde-badge" onclick="toggleHyDE()" title="HyDE: generate a hypothetical passage to improve retrieval accuracy (+1-2s latency)">
+        <div class="hyde-dot"></div>
+        <span id="hyde-label">🔬 HyDE OFF</span>
+      </div>
+
       <button class="action-btn" onclick="openIngestPanel()">🔄 Index library</button>
       <button class="action-btn" onclick="openThemeWorkflow()" style="border-color:var(--accent2);color:var(--accent2)">🏷️ Organiser la bibliothèque</button>
-      <button class="action-btn danger" onclick="clearChat()">🗑 Clear conversation</button>
+      <button class="action-btn" onclick="exportConversation()">💾 Export conversation</button>
+      <button class="action-btn danger" onclick="newConversation()">➕ New conversation</button>
       <button class="action-btn" onclick="settingsOpen()" style="border-color:var(--accent3);color:var(--accent3)">⚙️ Settings</button>
       <button class="action-btn danger" onclick="quitApp()" style="margin-top:8px;border-color:#f85149;color:#f85149;font-weight:600">⏻ Quit RefChat</button>
+    </div>
+
+    <!-- v1.5 — Conversation history -->
+    <div>
+      <div class="sidebar-section-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>History</span>
+        <button onclick="loadHistory()" style="background:transparent;border:none;color:var(--text3);font-size:0.8rem;cursor:pointer;padding:0" title="Refresh">↺</button>
+      </div>
+      <div id="history-list" style="display:flex;flex-direction:column;gap:3px;max-height:200px;overflow-y:auto;margin-top:4px;">
+        <div style="color:var(--text3);font-size:0.72rem;font-style:italic">No saved conversations</div>
+      </div>
     </div>
   </div>
 </div>
@@ -2604,9 +2830,19 @@ async function sendQuery() {
             html+=`<div class="articles-info"><div class="articles-info-title">📂 ${meta.articles.length} article(s) analyzed</div>`;
             for (const a of meta.articles) {
               const isWeb = (a.nb_chunks === 0 || (a.titre && a.titre.startsWith('🌐')));
+              const fnEnc = !isWeb && a.filename ? JSON.stringify(a.filename) : '';
+              const detailBtn = fnEnc
+                ? `<button onclick="openArticlePanel(${fnEnc})" title="Article details"
+                     style="background:transparent;border:1px solid var(--border);color:var(--text3);font-size:0.62rem;padding:1px 5px;border-radius:3px;cursor:pointer;margin-left:4px;flex-shrink:0"
+                     onmouseover="this.style.borderColor='var(--accent)';this.style.color='var(--accent)'"
+                     onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text3)'">🔍</button>`
+                : '';
               html+=`<div class="article-row" style="${isWeb ? 'border-left:2px solid var(--accent);padding-left:6px' : ''}">
                        <span>${isWeb ? '🌐 ' : ''}${escHtml(a.auteur)} (${escHtml(a.annee)}) — ${escHtml(a.titre)}</span>
-                       <span style="color:var(--text3);font-family:'DM Mono',monospace;font-size:0.72rem">${isWeb ? 'web' : a.nb_chunks+' chunks'}</span>
+                       <div style="display:flex;align-items:center;gap:2px;flex-shrink:0">
+                         <span style="color:var(--text3);font-family:'DM Mono',monospace;font-size:0.72rem">${isWeb ? 'web' : a.nb_chunks+' chunks'}</span>
+                         ${detailBtn}
+                       </div>
                      </div>`;
             }
             html+=`</div>`;
@@ -2644,11 +2880,16 @@ async function sendQuery() {
                   : '';
                 // Encodage base64 du chemin pour éviter tout conflit de guillemets dans onclick
                 const b64Path = btoa(unescape(encodeURIComponent(s.url || '')));
+                const fnDetail = s.filename ? JSON.stringify(s.filename) : '';
+                const detailBtn2 = fnDetail
+                  ? `<button onclick="event.stopPropagation();openArticlePanel(${fnDetail})" title="View article details"
+                       style="background:transparent;border:none;color:var(--accent);font-size:0.65rem;cursor:pointer;padding:0 2px;margin-left:3px;text-decoration:none;">🔍</button>`
+                  : '';
                 html+=`<span class="source-tag zotero-link" title="Open PDF"
                           onclick="openLocalPdf(atob('${b64Path}'))" style="cursor:pointer;">
                           📄 ${escHtml(s.auteur)}, ${escHtml(s.annee)}
                           <span style="font-size:0.62rem;opacity:0.6;margin-left:3px">↗ PDF</span>
-                        </span>${doiLink}`;
+                        </span>${doiLink}${detailBtn2}`;
               } else {
                 // Fallback : tag simple sans lien
                 html+=`<span class="source-tag">📄 ${escHtml(s.auteur)}, ${escHtml(s.annee)}</span>`;
@@ -3504,6 +3745,243 @@ document.getElementById('manage-db-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('manage-db-modal')) closeManageDB();
 });
 
+// ══ v1.5 — ARTICLE DETAIL PANEL ══════════════════════════════════════════════
+
+async function openArticlePanel(filename) {
+  const panel = document.getElementById('article-panel');
+  // Reset panel
+  document.getElementById('ap-title').textContent    = 'Loading…';
+  document.getElementById('ap-meta').innerHTML       = '';
+  document.getElementById('ap-abstract').innerHTML   = '<span style="color:var(--text3);font-style:italic">Loading…</span>';
+  document.getElementById('ap-sections').innerHTML   = '';
+  document.getElementById('ap-footer').innerHTML     = '';
+  panel.classList.add('open');
+
+  try {
+    const r = await fetch('/api/article/' + encodeURIComponent(filename));
+    const d = await r.json();
+    if (d.error) { document.getElementById('ap-title').textContent = '❌ ' + d.error; return; }
+
+    document.getElementById('ap-title').textContent = d.titre || filename;
+
+    // Meta rows
+    const rows = [
+      ['Author', d.auteur || '—'],
+      ['Year',   d.annee  || '—'],
+      d.journal ? ['Journal', d.journal] : null,
+      d.doi     ? ['DOI', `<a href="https://doi.org/${escHtml(d.doi)}" target="_blank" rel="noopener">${escHtml(d.doi)}</a>`] : null,
+      d.theme   ? ['Theme', d.theme] : null,
+      ['Type',  d.doc_type === 'thesis' ? '📖 Thesis' : '📄 Article'],
+      ['Chunks', d.nb_chunks + ' indexed'],
+    ].filter(Boolean);
+
+    document.getElementById('ap-meta').innerHTML = rows.map(([lbl, val]) =>
+      `<div class="ap-meta-row"><span class="ap-meta-label">${escHtml(lbl)}</span><span class="ap-meta-val">${val}</span></div>`
+    ).join('');
+
+    // Abstract
+    document.getElementById('ap-abstract').textContent = d.abstract
+      ? d.abstract
+      : 'No abstract available.';
+
+    // Sections chips
+    document.getElementById('ap-sections').innerHTML = (d.sections || [])
+      .map(s => `<span class="ap-sec-chip">${escHtml(s)}</span>`).join('');
+
+    // Footer buttons
+    let footerHtml = '';
+    if (d.file_link) {
+      const b64 = btoa(unescape(encodeURIComponent(d.source || '')));
+      footerHtml += `<button class="ap-btn primary" onclick="openLocalPdf(atob('${b64}'))">↗ Open PDF</button>`;
+    }
+    if (d.doi) {
+      footerHtml += `<a class="ap-btn" href="https://doi.org/${escHtml(d.doi)}" target="_blank" rel="noopener" style="text-decoration:none;display:flex;align-items:center;justify-content:center">🔗 DOI</a>`;
+    }
+    footerHtml += `<button class="ap-btn" onclick="closeArticlePanel()">Close</button>`;
+    document.getElementById('ap-footer').innerHTML = footerHtml;
+
+  } catch(e) {
+    document.getElementById('ap-title').textContent = '❌ Error: ' + e.message;
+  }
+}
+
+function closeArticlePanel() {
+  document.getElementById('article-panel').classList.remove('open');
+}
+
+// Close panel on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeArticlePanel();
+});
+
+// ══ v1.5 — EXPORT CONVERSATION ════════════════════════════════════════════════
+
+function exportConversation() {
+  const msgs = document.querySelectorAll('.message');
+  if (!msgs.length) { showToast('⚠️ No conversation to export', true); return; }
+
+  let md = `# RefChat — Conversation Export\n\n_${new Date().toLocaleDateString('en-GB', {year:'numeric',month:'long',day:'numeric'})}_\n\n---\n\n`;
+
+  for (const msg of msgs) {
+    if (msg.classList.contains('user')) {
+      const text = msg.querySelector('.bubble')?.textContent?.trim() || '';
+      md += `## 🧑 Question\n\n${text}\n\n`;
+    } else if (msg.classList.contains('bot')) {
+      const raw = msg.querySelector('.bubble')?._rawText || msg.querySelector('.bubble')?.textContent?.trim() || '';
+      md += `## 🤖 Answer\n\n${raw}\n\n`;
+      // Sources
+      const tags = msg.querySelectorAll('.source-tag');
+      if (tags.length) {
+        md += `**Sources:** `;
+        md += Array.from(tags).map(t => t.textContent.trim()).join(' · ');
+        md += '\n\n';
+      }
+      md += '---\n\n';
+    }
+  }
+
+  // Download as .md file
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  a.download = `refchat-${new Date().toISOString().slice(0,10)}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('✅ Conversation exported as Markdown');
+}
+
+// ══ v1.5 — HyDE TOGGLE ════════════════════════════════════════════════════════
+
+let hydeEnabled = false;
+
+async function toggleHyDE() {
+  const r = await fetch('/api/hyde/toggle', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ enabled: !hydeEnabled })
+  });
+  const d = await r.json();
+  hydeEnabled = d.hyde_enabled;
+  const badge = document.getElementById('hyde-badge');
+  const label = document.getElementById('hyde-label');
+  const dot   = badge.querySelector('.hyde-dot');
+  if (hydeEnabled) {
+    badge.classList.add('active');
+    dot.style.background = '#bc8cff';
+    dot.style.boxShadow  = '0 0 6px #bc8cff';
+    label.textContent = '🔬 HyDE ON';
+    sysMsg('— HyDE enabled: a hypothetical passage will be generated to improve retrieval (+1-2s latency) —');
+  } else {
+    badge.classList.remove('active');
+    dot.style.background = 'var(--text3)';
+    dot.style.boxShadow  = 'none';
+    label.textContent = '🔬 HyDE OFF';
+    sysMsg('— HyDE disabled: standard query enrichment —');
+  }
+}
+
+// ══ v1.5 — CONVERSATION HISTORY ══════════════════════════════════════════════
+
+let _histSessions = [];
+
+async function loadHistory() {
+  try {
+    const d = await (await fetch('/api/conversations')).json();
+    _histSessions = d.sessions || [];
+    renderHistory();
+  } catch(e) {
+    // silently fail — history is non-critical
+  }
+}
+
+function renderHistory() {
+  const el = document.getElementById('history-list');
+  if (!_histSessions.length) {
+    el.innerHTML = '<div style="color:var(--text3);font-size:0.72rem;font-style:italic">No saved conversations</div>';
+    return;
+  }
+  el.innerHTML = _histSessions.map(s =>
+    `<div class="hist-item" id="hist-${CSS.escape(s.id)}" onclick="loadHistorySession(${JSON.stringify(s.id)})">
+       <div class="hist-item-body">
+         <div class="hist-title">${escHtml(s.title || 'Unnamed')}</div>
+         <div class="hist-date">${escHtml(s.date || '')} · ${s.n || 0} Q</div>
+       </div>
+       <button class="hist-del" title="Delete" onclick="event.stopPropagation();deleteHistorySession(${JSON.stringify(s.id)})">✕</button>
+     </div>`
+  ).join('');
+}
+
+async function loadHistorySession(id) {
+  try {
+    const d = await (await fetch('/api/conversations/' + encodeURIComponent(id))).json();
+    if (d.error) { showToast('❌ ' + d.error, true); return; }
+
+    // Restore messages in the UI
+    messagesEl.querySelectorAll('.message,.thinking,.ingest-panel,div[style*="text-align:center"]').forEach(m=>m.remove());
+    if (welcomeEl) welcomeEl.style.display = 'none';
+
+    for (const msg of (d.messages || [])) {
+      if (msg.role === 'user') {
+        // Append user bubble
+        const div = document.createElement('div');
+        div.className = 'message user';
+        div.innerHTML = `<div class="avatar user-av">👤</div><div class="bubble">${escHtml(msg.content || '')}</div>`;
+        messagesEl.appendChild(div);
+      } else if (msg.role === 'assistant') {
+        // Append bot bubble with rendered markdown
+        const modeMap={question:['question','💬 Question'],resume:['resume','📋 Summary'],reference:['reference','🔎 References'],auteur:['auteur','👤 Author']};
+        const [mc, ml] = modeMap[msg.mode||'question'] || ['question','💬 Question'];
+        const div = document.createElement('div');
+        div.className = 'message bot';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.innerHTML = `<div class="mode-badge mode-${mc}">${ml}</div>` + marked.parse(msg.content || '');
+        bubble._rawText = msg.content || '';
+        div.innerHTML = `<div class="avatar bot-av">🤖</div>`;
+        div.appendChild(bubble);
+        if (msg.elapsed) {
+          const elapsed = document.createElement('div');
+          elapsed.className = 'elapsed-time';
+          elapsed.innerHTML = `<div class="elapsed-right"><span>⏱️ ${msg.elapsed}s</span></div>`;
+          bubble.appendChild(elapsed);
+        }
+        messagesEl.appendChild(div);
+      }
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    // Highlight active session
+    document.querySelectorAll('.hist-item').forEach(el => el.classList.remove('active'));
+    const activeEl = document.getElementById('hist-' + CSS.escape(id));
+    if (activeEl) activeEl.classList.add('active');
+
+    sysMsg('— Loaded conversation: ' + (d.title || id).slice(0, 60) + ' —');
+    showToast('✅ Conversation loaded');
+  } catch(e) {
+    showToast('❌ ' + e.message, true);
+  }
+}
+
+async function deleteHistorySession(id) {
+  if (!confirm('Delete this conversation?')) return;
+  try {
+    await fetch('/api/conversations/' + encodeURIComponent(id), { method: 'DELETE' });
+    _histSessions = _histSessions.filter(s => s.id !== id);
+    renderHistory();
+    showToast('🗑️ Conversation deleted');
+  } catch(e) {
+    showToast('❌ ' + e.message, true);
+  }
+}
+
+async function newConversation() {
+  clearChat();
+  await fetch('/api/conversations/new', { method: 'POST' });
+  await fetch('/api/clear_history', { method: 'POST' });
+  conversation_history_count = 0;
+  document.querySelectorAll('.hist-item').forEach(el => el.classList.remove('active'));
+  showToast('✅ New conversation started');
+}
+
 window.addEventListener('load', async () => {
   try {
     const r=await fetch('/api/setup/check'); const d=await r.json();
@@ -3526,10 +4004,12 @@ window.addEventListener('load', async () => {
   scanNouveauxArticles();
   loadThemes();      // charge l'accordéon thèmes dès le démarrage
   loadOCRQueue();    // badge PDFs image non indexés
+  loadHistory();     // v1.5 — conversation history sidebar
   // Re-scan every 60s to detect new Zotero articles without needing a page reload
   setInterval(scanNouveauxArticles, 60000);
-  setInterval(loadThemes, 120000);    // rafraîchit les thèmes toutes les 2 min
-  setInterval(loadOCRQueue, 120000);  // rafraîchit la queue OCR toutes les 2 min
+  setInterval(loadThemes,   120000);    // rafraîchit les thèmes toutes les 2 min
+  setInterval(loadOCRQueue, 120000);    // rafraîchit la queue OCR toutes les 2 min
+  setInterval(loadHistory,  30000);     // v1.5 — rafraîchit l'historique toutes les 30s
 
   try {
     const r=await fetch('/api/status'); const d=await r.json();

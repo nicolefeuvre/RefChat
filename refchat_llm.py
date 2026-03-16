@@ -540,9 +540,136 @@ def recuperer_articles_complets(db, query_enrichie, bm25_retriever=None, bm25_we
         chunk_limit = MAX_CHUNKS_THESIS if doc_type == "thesis" else max_chunks_par_article
         chunks_du_fichier.sort(key=lambda x: _SECTIONS_ORDER.get(x.metadata.get("section", ""), 10))
 
-        chunks_tries.extend(chunks_du_fichier[:chunk_limit])
+        # ── v1.5 Windowed retrieval: expand top chunks to include neighbours ──
+        # Only activates for articles indexed with chunk_seq (v1.5+).
+        # For each selected chunk that has a chunk_seq, we try to fetch
+        # the immediately preceding/following chunk to avoid truncated context.
+        selected = chunks_du_fichier[:chunk_limit]
+        has_seq  = any(c.metadata.get("chunk_seq") is not None for c in selected)
+
+        if has_seq:
+            # Collect all chunk_seqs already present in docs_finaux for this article
+            all_fname_chunks = {c.metadata.get("chunk_seq"): c
+                                for c in docs_finaux
+                                if c.metadata.get("filename") == fname
+                                and c.metadata.get("chunk_seq") is not None}
+
+            expanded_ids = set()
+            windowed = []
+            for chunk in selected:
+                seq = chunk.metadata.get("chunk_seq")
+                if seq is not None:
+                    for neighbour_seq in (seq - 1, seq, seq + 1):
+                        if neighbour_seq not in expanded_ids and neighbour_seq in all_fname_chunks:
+                            windowed.append(all_fname_chunks[neighbour_seq])
+                            expanded_ids.add(neighbour_seq)
+                else:
+                    windowed.append(chunk)
+
+            # Re-sort windowed result by section order
+            windowed.sort(key=lambda x: (
+                _SECTIONS_ORDER.get(x.metadata.get("section", ""), 10),
+                x.metadata.get("chunk_seq", 999)
+            ))
+            selected = windowed[:chunk_limit + 4]  # allow a few extra for windowed context
+
+        chunks_tries.extend(selected)
 
     return articles_info, chunks_tries
+
+
+# ══ HyDE — HYPOTHETICAL DOCUMENT EMBEDDINGS ═══════════════════════════════════
+
+def hyde_generate(query: str, llm) -> str:
+    """Generate a hypothetical scientific passage that would answer the query.
+
+    The embedding of this passage is much closer to real document chunks
+    than the raw query embedding, typically giving +10-20% retrieval precision.
+    Falls back to the original query on any error.
+    """
+    try:
+        prompt = (
+            "You are a scientific writer. Write a 2-3 sentence scientific passage "
+            "that directly answers the following question, as if extracted from a "
+            "peer-reviewed research article. Use precise, domain-specific language. "
+            "Do NOT mention the question or use phrases like 'This study shows' — "
+            "write as a standalone scientific excerpt.\n\n"
+            f"Question: {query}\n\nPassage:"
+        )
+        result = llm.invoke(prompt)
+        text = result.content if hasattr(result, "content") else str(result)
+        # Keep only the first paragraph, trim artefacts
+        text = text.strip().split("\n\n")[0].strip()
+        if len(text) > 40:
+            print(f"💡 HyDE: {len(text)} char passage generated")
+            return text
+    except Exception as e:
+        print(f"⚠️  HyDE failed ({e}), using original query")
+    return query
+
+
+# ══ ARTICLE DETAIL ════════════════════════════════════════════════════════════
+
+def get_article_details(db, filename: str) -> dict:
+    """Return full metadata + abstract + section list for a given article.
+
+    Used by the /api/article/<filename> endpoint to populate the detail panel.
+    """
+    try:
+        result = db._collection.get(
+            where={"filename": {"$eq": filename}},
+            include=["documents", "metadatas"]
+        )
+        if not result["documents"]:
+            return {"error": "Article not found"}
+
+        docs  = result["documents"]
+        metas = result["metadatas"]
+        meta0 = metas[0] if metas else {}
+
+        # Find abstract (prefer section == "Abstract")
+        abstract_text = ""
+        for doc, meta in zip(docs, metas):
+            if meta.get("section") == "Abstract":
+                abstract_text = doc
+                break
+
+        # Collect unique section names in canonical order
+        seen_sec = {}
+        for meta in metas:
+            sec = meta.get("section", "Full text")
+            if sec not in seen_sec:
+                seen_sec[sec] = _SECTIONS_ORDER.get(sec, 99)
+        sections = [s for s, _ in sorted(seen_sec.items(), key=lambda x: x[1])]
+
+        # Build file:// link for PDF
+        source_path = meta0.get("source", "")
+        file_link = ""
+        if source_path and not source_path.startswith("http"):
+            import urllib.parse as _up, os as _os
+            if _os.path.isfile(source_path):
+                norm = source_path.replace("\\", "/")
+                if not norm.startswith("/"):
+                    norm = "/" + norm
+                file_link = "file://" + _up.quote(norm, safe=":/")
+
+        return {
+            "filename":  filename,
+            "auteur":    meta0.get("auteur", ""),
+            "annee":     meta0.get("annee", ""),
+            "titre":     meta0.get("titre", ""),
+            "journal":   meta0.get("journal", ""),
+            "doi":       meta0.get("doi", ""),
+            "doc_type":  meta0.get("doc_type", "article"),
+            "theme":     meta0.get("theme", ""),
+            "source":    source_path,
+            "file_link": file_link,
+            "nb_chunks": len(docs),
+            "abstract":  abstract_text,
+            "sections":  sections,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ══ EXTRACTION DE MOTS-CLÉS VIA LLM ══════════════════════════════════════════
