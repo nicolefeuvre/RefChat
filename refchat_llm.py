@@ -1,48 +1,6 @@
 import warnings
 import os
 warnings.filterwarnings("ignore")
-import sys
-import subprocess
-import importlib.util
-
-def install_if_missing():
-    """Vérifie et installe les dépendances manquantes au démarrage."""
-    dependencies = {
-        "fitz": "pymupdf",
-        "langchain": "langchain",
-        "langchain_community": "langchain-community",
-        "langchain_huggingface": "langchain-huggingface",
-        "langchain_chroma": "langchain-chroma",
-        "langchain_ollama": "langchain-ollama",
-        "langchain_mistralai": "langchain-mistralai",
-        "langchain_text_splitters": "langchain-text-splitters",
-        "chromadb": "chromadb",
-        "torch": "torch",
-        "tqdm": "tqdm",
-        "sentence_transformers": "sentence-transformers"
-    }
-    
-    missing = []
-    for module_name, package_name in dependencies.items():
-        if importlib.util.find_spec(module_name) is None:
-            missing.append(package_name)
-    
-    if missing:
-        print(f"📦 Missing libraries detected : {', '.join(missing)}")
-        print("⏳ Installation automatique en cours...")
-        try:
-            # 1. Installation
-            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-            print("✅ Installation terminée. Relance automatique du script...")
-            
-            # 2. Relance le script actuel pour prendre en compte les nouveaux paquets
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        except Exception as e:
-            print(f"❌ Installation error : {e}")
-            sys.exit(1)
-
-# Lancer l'installation avant d'exécuter le reste du code
-install_if_missing()
 
 # ── OPTIMISATION CPU ──
 os.environ["OMP_NUM_THREADS"] = "8"
@@ -61,7 +19,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 
 # MODIFICATION ICI : Appel de refchat_config
-from refchat_config import EMBEDDING_MODEL, OLLAMA_TEMPERATURE, get as config_get
+from refchat_config import EMBEDDING_MODEL, OLLAMA_TEMPERATURE, PERSONAL_DATA, get as config_get
 from refchat_config import get_ollama_num_ctx_local, get_ollama_temperature
 DB_PATH = config_get('db_path', '')
 
@@ -152,12 +110,8 @@ def expand_query(query):
     enriched = query + " " + " ".join(extras) if extras else query
 
     # E5 exige le préfixe "query: " pour les requêtes
-    try:
-        from refchat_config import EMBEDDING_MODEL
-        if "e5" in EMBEDDING_MODEL.lower():
-            enriched = f"query: {enriched}"
-    except ImportError:
-        pass
+    if "e5" in EMBEDDING_MODEL.lower():
+        enriched = f"query: {enriched}"
 
     return enriched
 
@@ -311,41 +265,199 @@ def detecter_theme_query(query, themes_disponibles):
             return t
     return None
 
-def recuperer_articles_complets(db, query_enrichie, k_initial=8, max_articles=4, max_chunks_par_article=20, theme_filter=None):
-    from langchain_core.documents import Document
+MAX_CHUNKS_THESIS = 5   # plafond chunks pour thèses (vs max_chunks_par_article pour articles)
+MAX_THESIS_SLOTS  = 1   # nb max de thèses parmi les articles sélectionnés
 
+# ── BM25 HYBRID SEARCH ────────────────────────────────────────────────────────
+
+import pickle as _pickle
+import time   as _time_bm25
+from pathlib import Path as _PathBM25
+
+_BM25_CACHE     = PERSONAL_DATA / "bm25_index.pkl"
+_TRACKING_FILE  = PERSONAL_DATA / "refchat_index_db.json"
+
+
+def charger_bm25(db, bm25_cache=None, tracking_file=None):
+    """Build or load BM25 retriever from all ChromaDB chunks.
+
+    Uses a .pkl cache to avoid rebuilding at every startup (~8-15s).
+    Automatically rebuilds if refchat_index_db.json is newer than the cache
+    (i.e. after a re-indexation).
+    Returns None if rank-bm25 is not installed.
+    """
+    bm25_cache    = _PathBM25(bm25_cache    or _BM25_CACHE)
+    tracking_file = _PathBM25(tracking_file or _TRACKING_FILE)
+
+    # ── 1. Try loading from cache ──────────────────────────────────────────
+    if bm25_cache.exists() and tracking_file.exists():
+        if bm25_cache.stat().st_mtime > tracking_file.stat().st_mtime:
+            try:
+                with open(bm25_cache, "rb") as f:
+                    retriever = _pickle.load(f)
+                print(f"✅ BM25 index loaded from cache ({bm25_cache.name})")
+                return retriever
+            except Exception as e:
+                print(f"⚠️  BM25 cache corrupted ({e}), rebuilding…")
+
+    # ── 2. Check dependency ────────────────────────────────────────────────
+    try:
+        from langchain_community.retrievers import BM25Retriever
+    except ImportError:
+        print("⚠️  BM25 unavailable — install: pip install rank-bm25")
+        return None
+
+    # ── 3. Build from ChromaDB ─────────────────────────────────────────────
+    total = db._collection.count()
+    if total == 0:
+        print("⚠️  BM25: database is empty, skipping.")
+        return None
+
+    print(f"⏳ Building BM25 index from {total} chunks…")
+    t0 = _time_bm25.time()
+
+    tous_docs, tous_metas = [], []
+    for offset in range(0, total, 2000):
+        r = db._collection.get(limit=2000, offset=offset, include=["documents", "metadatas"])
+        tous_docs.extend(r["documents"])
+        tous_metas.extend(r["metadatas"])
+
+    from langchain_core.documents import Document as _Doc
+    documents = [_Doc(page_content=d, metadata=m) for d, m in zip(tous_docs, tous_metas)]
+
+    retriever = BM25Retriever.from_documents(documents, k=20)
+
+    # ── 4. Save to disk ────────────────────────────────────────────────────
+    try:
+        with open(bm25_cache, "wb") as f:
+            _pickle.dump(retriever, f)
+        print(f"✅ BM25 index built ({len(documents)} chunks, {_time_bm25.time()-t0:.1f}s) — cached to {bm25_cache.name}")
+    except Exception as e:
+        print(f"⚠️  BM25 cache save failed: {e}")
+
+    return retriever
+
+
+def _rrf_select_articles(docs_dense, docs_bm25, n_candidates, bm25_weight, rrf_k=60):
+    """Reciprocal Rank Fusion: merge dense and BM25 ranked doc lists.
+
+    Returns top n_candidates filenames by combined RRF score.
+    Thesis slot limits and final max_articles selection are applied by the caller.
+    Score per article = (1-bm25_weight)*dense_rrf + bm25_weight*bm25_rrf
+    """
+    dense_scores = {}
+    for rank, doc in enumerate(docs_dense):
+        fname = doc.metadata.get("filename")
+        if fname:
+            dense_scores[fname] = dense_scores.get(fname, 0) + 1 / (rank + rrf_k)
+
+    bm25_scores = {}
+    for rank, doc in enumerate(docs_bm25):
+        fname = doc.metadata.get("filename")
+        if fname:
+            bm25_scores[fname] = bm25_scores.get(fname, 0) + 1 / (rank + rrf_k)
+
+    all_fnames = set(dense_scores) | set(bm25_scores)
+    combined = {
+        fname: (1 - bm25_weight) * dense_scores.get(fname, 0)
+              + bm25_weight       * bm25_scores.get(fname, 0)
+        for fname in all_fnames
+    }
+
+    return sorted(combined, key=lambda f: combined[f], reverse=True)[:n_candidates]
+
+
+def recuperer_articles_complets(db, query_enrichie, bm25_retriever=None, bm25_weight=0.3,
+                                 k_initial=8, max_articles=4, max_chunks_par_article=20,
+                                 theme_filter=None, reranker=None):
     # Build optional theme pre-filter for ChromaDB
     # When a theme is detected, restrict the vector search to that theme's chunks only
     chroma_filter_abstract = {"section": "Abstract"}
+    chroma_filter_fulltext = {"section": "Full text"}   # covers GROBID-fallback docs
     chroma_filter_full     = None
     if theme_filter:
         chroma_filter_abstract = {"$and": [{"section": {"$eq": "Abstract"}}, {"theme": {"$eq": theme_filter}}]}
+        chroma_filter_fulltext = {"$and": [{"section": {"$eq": "Full text"}}, {"theme": {"$eq": theme_filter}}]}
         chroma_filter_full     = {"theme": {"$eq": theme_filter}}
 
-    retriever_abstracts = db.as_retriever(
-        search_kwargs={
-            "k": k_initial,
-            "filter": chroma_filter_abstract
-        }
-    )
-    docs_abstracts = retriever_abstracts.invoke(query_enrichie)
+    # Large-k search across ALL candidates before selecting top N.
+    # This ensures globally-best articles are ranked, not just the first k found.
+    # "Full text" search catches documents indexed without GROBID (no "Abstract" chunk).
+    k_candidates   = max(k_initial * 15, 150)
+    docs_abstracts = db.similarity_search(query_enrichie, k=k_candidates, filter=chroma_filter_abstract)
+    docs_fulltext  = db.similarity_search(query_enrichie, k=k_candidates, filter=chroma_filter_fulltext)
 
-    articles_pertinents = []
-    for doc in docs_abstracts:
+    # Merge: build per-filename rank map (lower = more relevant).
+    # Abstract hits take priority; Full text fills the gaps for fallback-indexed docs.
+    rank_map      = {}  # fname → best rank position
+    doc_types_map = {}  # fname → doc_type
+    repr_docs     = {}  # fname → one representative doc (for RRF input)
+    ordered_fnames = []
+
+    for rank, doc in enumerate(docs_abstracts):
         fname = doc.metadata.get("filename")
-        if fname and fname not in articles_pertinents:
-            articles_pertinents.append(fname)
-            if len(articles_pertinents) == max_articles:
-                break
+        if not fname:
+            continue
+        if fname not in rank_map:
+            rank_map[fname]      = rank
+            doc_types_map[fname] = doc.metadata.get("doc_type", "article")
+            repr_docs[fname]     = doc
+            ordered_fnames.append(fname)
 
-    if not articles_pertinents:
-        docs_fallback = db.similarity_search(query_enrichie, k=k_initial)
-        for doc in docs_fallback:
+    fulltext_offset = len(docs_abstracts)
+    for rank, doc in enumerate(docs_fulltext):
+        fname = doc.metadata.get("filename")
+        if not fname or fname in rank_map:
+            continue
+        rank_map[fname]      = fulltext_offset + rank
+        doc_types_map[fname] = doc.metadata.get("doc_type", "article")
+        repr_docs[fname]     = doc
+        ordered_fnames.append(fname)
+
+    # Sort all unique candidates by best relevance rank
+    sorted_fnames = sorted(ordered_fnames, key=lambda f: rank_map[f])
+
+    # Number of candidates to feed the reranker (4× final target, min 20)
+    n_candidates = min(max(max_articles * 4, 20), len(sorted_fnames))
+
+    if bm25_retriever is not None:
+        # ── Hybrid: BM25 + Dense via RRF ──────────────────────────────────
+        bm25_retriever.k = k_initial * 4
+        docs_bm25 = bm25_retriever.invoke(query_enrichie)
+        if theme_filter:
+            docs_bm25 = [d for d in docs_bm25 if d.metadata.get("theme", "") == theme_filter]
+        # Supplement repr_docs / doc_types_map with BM25-only hits
+        for doc in docs_bm25:
             fname = doc.metadata.get("filename")
-            if fname and fname not in articles_pertinents:
-                articles_pertinents.append(fname)
-                if len(articles_pertinents) == max_articles:
-                    break
+            if fname and fname not in repr_docs:
+                repr_docs[fname]     = doc
+                doc_types_map[fname] = doc.metadata.get("doc_type", "article")
+        # One representative doc per file (dense-ranked) feeds the RRF scorer
+        docs_dense_repr  = [repr_docs[f] for f in sorted_fnames if f in repr_docs]
+        candidate_fnames = _rrf_select_articles(docs_dense_repr, docs_bm25, n_candidates, bm25_weight)
+    else:
+        # ── Dense uniquement ───────────────────────────────────────────────
+        candidate_fnames = sorted_fnames[:n_candidates]
+
+    # ── Cross-encoder reranking (optional) ────────────────────────────────
+    if reranker is not None and len(candidate_fnames) > max_articles:
+        fnames_to_rank = [f for f in candidate_fnames if f in repr_docs]
+        pairs  = [(query_enrichie, repr_docs[f].page_content) for f in fnames_to_rank]
+        scores = reranker.predict(pairs)
+        candidate_fnames = [f for _, f in sorted(zip(scores, fnames_to_rank), reverse=True)]
+
+    # ── Sélection finale : thesis slot limit + top max_articles ───────────
+    articles_pertinents = []
+    nb_thesis_selected  = 0
+    for fname in candidate_fnames:
+        doc_type = doc_types_map.get(fname, "article")
+        if doc_type == "thesis" and nb_thesis_selected >= MAX_THESIS_SLOTS:
+            continue
+        if doc_type == "thesis":
+            nb_thesis_selected += 1
+        articles_pertinents.append(fname)
+        if len(articles_pertinents) == max_articles:
+            break
 
     if not articles_pertinents:
         return [], []
@@ -370,19 +482,22 @@ def recuperer_articles_complets(db, query_enrichie, k_initial=8, max_articles=4,
         if not chunks_du_fichier:
             continue
 
-        meta0 = chunks_du_fichier[0].metadata
+        meta0    = chunks_du_fichier[0].metadata
+        doc_type = meta0.get("doc_type", "article")
         articles_info.append({
             "filename": fname,
-            "auteur": meta0.get("auteur", ""),
-            "annee": meta0.get("annee", ""),
-            "titre": meta0.get("titre", ""),
+            "auteur":   meta0.get("auteur", ""),
+            "annee":    meta0.get("annee", ""),
+            "titre":    meta0.get("titre", ""),
             "nb_chunks": len(chunks_du_fichier),
-            "score": len(chunks_du_fichier) 
+            "score":    len(chunks_du_fichier),
+            "doc_type": doc_type,
         })
 
+        chunk_limit = MAX_CHUNKS_THESIS if doc_type == "thesis" else max_chunks_par_article
         chunks_du_fichier.sort(key=lambda x: _SECTIONS_ORDER.get(x.metadata.get("section", ""), 10))
-        
-        chunks_tries.extend(chunks_du_fichier[:max_chunks_par_article])
+
+        chunks_tries.extend(chunks_du_fichier[:chunk_limit])
 
     return articles_info, chunks_tries
 
@@ -433,7 +548,7 @@ import json    as _json_ss
 import time    as _time_ss
 from pathlib import Path as _Path
 
-_SS_CACHE_DIR  = _Path(__file__).parent / ".semantic_cache"
+_SS_CACHE_DIR  = PERSONAL_DATA / "semantic_cache"
 _SS_CACHE_TTL  = 86400   # 24 heures en secondes
 _SS_MIN_DELAY  = 3.0     # secondes minimum entre deux appels réseau (augmenté de 2→3)
 _SS_LAST_CALL  = 0.0     # timestamp du dernier appel (variable globale module)
@@ -688,7 +803,7 @@ PROMPT_QUESTION = ChatPromptTemplate.from_messages([
      "1. INTRODUCTION: A natural prose paragraph setting the context before going into details.\n"
      "2. IN-TEXT CITATIONS: Integrate sources directly into your narrative as (Author et al., Year).\n"
      "3. EXHAUSTIVE COVERAGE: You are OBLIGATED to use information from EVERY author mentioned in the context.\n"
-     "4. VISUAL STRUCTURE: Titles in UPPERCASE with thematic emoji. Underline EACH title with long dashes: ────────────────────────. NEVER use '##'.\n"
+     "4. VISUAL STRUCTURE: Titles in UPPERCASE with thematic emoji. After each title, add exactly this separator on the next line (copy verbatim, never shorter or longer): ──────────────────────────────────────. NEVER use '##'.\n"
      "5. CONTENT: Write EXCLUSIVELY in continuous narrative prose. ABSOLUTE PROHIBITION on bullet points (-, *, •) anywhere in the response. Numbered lists (1. 2. 3.) are allowed ONLY for ranked steps or structured plans. Measurements and data must be integrated into sentences, not listed.\n"
      "6. STRICT SOURCES: Only cite authors explicitly present in the provided context. ABSOLUTE PROHIBITION on using training knowledge to add references. If an author is not in the context, they do not exist for this answer.\n"
      "7. WEB DISTINCTION: Only if an excerpt's section is 'Web Search', add '[Web Source]' after the citation. Never add it on your own initiative.\n"
@@ -711,7 +826,7 @@ PROMPT_RESUME = ChatPromptTemplate.from_messages([
      "GOLDEN RULES:\n"
      "1. SYNTHESIS: Do not summarize article by article. Weave a logical narrative where ideas respond to each other.\n"
      "2. CITATIONS: Use the format (Author et al., Year) at the heart of your sentences to attribute findings.\n"
-     "3. VISUAL: Titles in UPPERCASE + Emoji + Separator line: ────────────────────────. No '##'. Numbered sections (1. 2. 3.) are encouraged for structure.\n"
+     "3. VISUAL: Titles in UPPERCASE + Emoji + add exactly this separator after each title (copy verbatim): ──────────────────────────────────────. No '##'. Numbered sections (1. 2. 3.) are encouraged for structure.\n"
      "4. RICHNESS: Preserve all technical measurements and geological structure names.\n"
      "4b. PROSE ONLY: Write in continuous narrative prose. ABSOLUTE PROHIBITION on bullet points (-, *, •) anywhere. Data and measurements must be integrated into sentences, not listed.\n"
      "5. STRICT SOURCES: Only cite authors present in the provided context. ABSOLUTE PROHIBITION on adding references from training knowledge.\n"

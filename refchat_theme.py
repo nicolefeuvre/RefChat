@@ -61,7 +61,7 @@ except ImportError:
     pass
 
 try:
-    from refchat_config import EMBEDDING_MODEL, get as cfg_get
+    from refchat_config import EMBEDDING_MODEL, PERSONAL_DATA, get as cfg_get
     DB_PATH = cfg_get("db_path", str(_BASE / "chroma_db"))
 except ImportError:
     EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
@@ -453,7 +453,7 @@ def main():
 
     if not args.dry_run:
         _update_chroma_metadata(db, article_map, filename_to_theme)
-        map_path = _BASE / "refchat_themes.json"
+        map_path = PERSONAL_DATA / "refchat_themes.json"
         _save_theme_map(filename_to_theme, map_path)
     else:
         print("\n   (dry-run : ChromaDB non modifie)")

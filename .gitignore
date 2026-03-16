@@ -1,0 +1,15 @@
+# ── Données personnelles (DB, config, clés API) ──────────────────────────────
+personal_data/
+
+# ── Environnement Python ──────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Cache HuggingFace / modèles ───────────────────────────────────────────────
+.cache/
+
+# ── Fichiers temporaires ──────────────────────────────────────────────────────
+*.tmp
+*.log
