@@ -4029,10 +4029,10 @@ window.addEventListener('load', async () => {
 # ── Lancement ─────────────────────────────────────────────────────────────────
 def open_browser():
     time.sleep(1.5)
-    webbrowser.open("http://localhost:5001")
+    webbrowser.open("http://localhost:8001")
 
 if __name__ == "__main__":
     print("🌐 RefChat — démarrage sur http://localhost:5001")
     print("   Ouverture automatique du navigateur…")
     threading.Thread(target=open_browser, daemon=True).start()
-    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=8001, debug=False, threaded=True)

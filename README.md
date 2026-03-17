@@ -217,13 +217,19 @@ pip install flask langchain langchain-community langchain-chroma \
 
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# 3. Install Ollama → https://ollama.com/download
+#install Ollama
+curl -fsSL https://ollama.com/install.sh | sh
 ollama pull mistral:7b-instruct-q4_0
 
-# 4. (Optional) Start GROBID via Docker
+
+# 4. install Docker and GROBID via docker: 
+sudo dnf install docker-ce docker-ce-cli containerd.io
+sudo docker pull grobid/grobid:0.8.2-full
+
+# 5. (Optional) Start GROBID via Docker, used to parse PDFs 
 docker run -d --rm -p 8070:8070 lfoppiano/grobid:0.8.1
 
-# 5. Launch RefChat
+# 6. Launch RefChat
 python refchat_web.py
 # → Open http://localhost:5001
 ```

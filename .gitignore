@@ -1,15 +1,31 @@
-# ── Données personnelles (DB, config, clés API) ──────────────────────────────
-personal_data/
+# ── Configuration utilisateur (contient clés API) ──
+refchat_config.json
 
-# ── Environnement Python ──────────────────────────────────────────────────────
-.venv/
+# ── Base vectorielle (volumineuse, régénérable) ──
+chroma_db/
+
+# ── Cache Semantic Scholar ──
+.semantic_cache/
+
+# ── Python ──
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+.venv/
+venv/
+env/
+*.egg-info/
 
-# ── Cache HuggingFace / modèles ───────────────────────────────────────────────
-.cache/
-
-# ── Fichiers temporaires ──────────────────────────────────────────────────────
-*.tmp
+# ── Logs ──
 *.log
+logs/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
